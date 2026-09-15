@@ -36,7 +36,7 @@ def executor(monkeypatch):
 
     monkeypatch.setattr(stages, "NemotronDiarizer", RecordingDiarizer)
     scheduler = stages.create_diarization_executor("unused", device="cuda", gpu_id=3)
-    assert scheduler._max_concurrency == 1  # NeMo's mutable cache is not reentrant.
+    assert scheduler._max_concurrency == 1  # Serialize inference to bound GPU memory.
     return scheduler, calls
 
 
