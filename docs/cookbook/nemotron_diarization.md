@@ -8,27 +8,17 @@ Speaker labels are local to each recording. It does not produce transcripts.
 ## Install
 
 Use an NVIDIA GPU, Python 3.12, and the normal SGLang-Omni system dependencies
-(including FFmpeg for compressed audio). From the Omni checkout, install the
-optional NeMo source together with Omni so its exact dependency pins remain
-constraints during resolution. Keep the source checkout on persistent storage:
+(including FFmpeg for compressed audio). Install Omni from the checkout:
 
 ```bash
-NEMO_SOURCE=/path/to/persistent/NeMo-Speech
-git clone https://github.com/NVIDIA-NeMo/Speech.git "$NEMO_SOURCE"
-git -C "$NEMO_SOURCE" checkout 2c1a2f91d64566b5d391b83df42f9ab4cd810adb
-uv pip install --prerelease=allow -e . -e "${NEMO_SOURCE}[asr]"
+uv pip install --prerelease=allow -e .
 ```
 
-This revision includes the RoPE encoder and high-resolution Sortformer output
-required by this checkpoint, and declares `lhotse==2.0.0a6`. Released
-`nemo-toolkit==3.0.0` cannot load this model. NeMo is imported only when the
-diarization stage starts; other models do not require it.
-
-The wrapper and HTTP path were exercised with Torch 2.13.0, Torchaudio 2.11.0,
-Torchvision 0.28.0, Transformers 5.12.1, SGLang 0.5.19, and this NeMo source
-revision on an H100. NeMo reports version 3.1.0 at this source revision;
-this is not a tested release-wheel installation. Prereleases are needed by
-the pinned SGLang dependency set and NeMo's Lhotse requirement.
+Inference uses native PyTorch modules and does not require NeMo. The loader reads
+`model_config.yaml` with `yaml.safe_load` and loads the tensor state dictionary
+from `model_weights.ckpt` with `torch.load(weights_only=True)`. It does not
+instantiate YAML targets or extract archive paths. Unsupported architecture or
+preprocessing settings and missing/unexpected weights fail at startup.
 
 The preview checkpoint is gated. Obtain access on its Hugging Face page and
 configure your Hugging Face authentication before starting the server. Its
@@ -50,7 +40,7 @@ One GPU runs a serial `SimpleScheduler` stage. It restores the checkpoint with
 strict weight matching and uses FP32 inference. Incoming audio is decoded,
 downmixed, and resampled to 16 kHz using the shared audio utilities.
 
-The default `offline` profile processes the recording in NeMo's internal
+The default `offline` profile processes the recording in internal
 chunks, retaining speaker-cache state across those chunks. A smaller internal
 buffer is available with:
 
@@ -61,10 +51,9 @@ sgl-omni serve --config examples/configs/nemotron_diarization.yaml \
 
 Both profiles return a single response after the recording completes. They do
 not enable live audio input or streamed HTTP results. Concurrent uploads are
-queued; NeMo calls are serialized because its inference helper temporarily
-changes model/preprocessor state. Cancelling a request discards its result;
-an already-running NeMo inference call finishes before the worker can accept
-another recording.
+queued to bound GPU memory. Each recording owns fresh speaker-cache state.
+Cancelling a request discards its result; an already-running inference call
+finishes before the worker can accept another recording.
 
 The model has eight speaker channels. Recordings with nine or more speakers
 are outside its supported capacity; the service cannot determine the true
@@ -104,10 +93,21 @@ and rejected. Use a separate ASR model if a transcript is also needed.
 
 ## Implementation boundary
 
-`models/nemotron_diarization/backend.py` owns NeMo loading and inference;
-`stages.py` owns the Omni request boundary. The client result and HTTP response
-contain ordinary speaker intervals with no checkpoint-format details. A later
-native implementation can replace the backend while retaining this interface.
+`models/nemotron_diarization/backend.py` owns archive loading and interval
+postprocessing; `model.py` implements the encoder and speaker head, and
+`speaker_cache.py` retains arrival-order speaker context. `stages.py` owns the
+Omni request boundary. The client and HTTP schema are unchanged from the NeMo
+wrapper baseline.
+
+The inference math is adapted from Apache-2.0 NVIDIA-NeMo/Speech revision
+`2c1a2f91d64566b5d391b83df42f9ab4cd810adb`. The implementation supports this
+published FP32 checkpoint, with PyTorch FlexAttention and 10 ms output frames.
+The cache/FIFO/chunk settings use 80 ms encoder frames:
+
+| Profile | Speaker cache | FIFO | Chunk | Right context | Cache update period |
+| --- | --- | --- | --- | --- | --- |
+| `offline` | 264 | 40 | 340 | 40 | 300 |
+| `low_latency` | 264 | 264 | 9 | 4 | 222 |
 
 ## Validation
 
@@ -117,6 +117,16 @@ Run the CPU unit tests with the normal repository test dependencies:
 pytest tests/unit_test/nemotron_diarization tests/unit_test/serve/test_diarizations.py
 ```
 
+Parity tests use NeMo as a development-only reference. Install the pinned
+source in your test environment before running them:
+
+```bash
+NEMO_SOURCE=/path/to/persistent/NeMo-Speech
+git clone https://github.com/NVIDIA-NeMo/Speech.git "$NEMO_SOURCE"
+git -C "$NEMO_SOURCE" checkout 2c1a2f91d64566b5d391b83df42f9ab4cd810adb
+uv pip install --prerelease=allow -e . -e "${NEMO_SOURCE}[asr]"
+```
+
 Run the opt-in integration tests with a locally available checkpoint:
 
 ```bash
@@ -124,8 +134,9 @@ NEMOTRON_DIARIZATION_CHECKPOINT=/path/to/checkpoint \
   python -m pytest tests/test_model/test_nemotron_diarization.py -q
 ```
 
-These tests launch real HTTP servers for both profiles and compare intervals
-with direct NeMo using identical preprocessing. They cover silence, malformed
+These tests launch real HTTP servers for both profiles with NeMo imports
+blocked in the server processes. They compare native frame probabilities and
+HTTP intervals exactly with direct NeMo using identical preprocessing. They cover silence, malformed
 and empty audio, stereo/resampling, partial final frames, cache updates in a
 67-second recording, and sequential/concurrent request isolation. Set
 `NEMOTRON_DIARIZATION_AUDIO_DIR` to include additional permitted WAV recordings.

@@ -12,7 +12,7 @@ import torch
 
 from sglang_omni.client import Client, DiarizationResult, GenerateRequest
 from sglang_omni.models.nemotron_diarization import stages
-from sglang_omni.models.nemotron_diarization.backend import NeMoDiarizer
+from sglang_omni.models.nemotron_diarization.backend import NemotronDiarizer
 from sglang_omni.proto import StagePayload
 
 
@@ -34,7 +34,7 @@ def executor(monkeypatch):
             calls.append(waveform)
             return DiarizationResult(duration=len(waveform) / 16000, segments=[])
 
-    monkeypatch.setattr(stages, "NeMoDiarizer", RecordingDiarizer)
+    monkeypatch.setattr(stages, "NemotronDiarizer", RecordingDiarizer)
     scheduler = stages.create_diarization_executor("unused", device="cuda", gpu_id=3)
     assert scheduler._max_concurrency == 1  # NeMo's mutable cache is not reentrant.
     return scheduler, calls
@@ -101,10 +101,10 @@ def test_low_level_client_cannot_silently_apply_generation_controls(executor, pa
     assert not calls
 
 
-def test_missing_optional_nemo_fails_before_checkpoint_download(monkeypatch):
+def test_native_loader_does_not_require_nemo(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "nemo", None)
-    with pytest.raises(ImportError, match="optional NeMo ASR dependencies"):
-        NeMoDiarizer("missing/repository", device=torch.device("cuda:0"))
+    with pytest.raises(FileNotFoundError, match="Missing checkpoint"):
+        NemotronDiarizer(str(tmp_path / "missing.nemo"), device=torch.device("cuda:0"))
 
 
 @pytest.mark.parametrize(
@@ -116,4 +116,4 @@ def test_missing_optional_nemo_fails_before_checkpoint_download(monkeypatch):
 )
 def test_unsupported_deployment_fails_before_checkpoint_download(kwargs, message):
     with pytest.raises(ValueError, match=message):
-        NeMoDiarizer("missing/repository", **kwargs)
+        NemotronDiarizer("missing/repository", **kwargs)

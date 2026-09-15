@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in real NeMo/HTTP parity. Set NEMOTRON_DIARIZATION_CHECKPOINT locally.
+"""Opt-in native/NeMo probability and HTTP parity.
 
 No checkpoint or evaluation output is downloaded or included in the repository.
 Additional permitted conversational WAV fixtures can be supplied through
@@ -10,6 +10,7 @@ not model accuracy; DER requires reference speaker annotations.
 import io
 import os
 import sys
+import tarfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -48,7 +49,10 @@ def checkpoint():
 def deployment(checkpoint, request, tmp_path_factory):
     from nemo.collections.asr.models import SortformerEncLabelModel
 
-    from sglang_omni.models.nemotron_diarization.backend import resolve_nemo_checkpoint
+    from sglang_omni.models.nemotron_diarization.backend import (
+        NemotronDiarizer,
+        resolve_nemo_checkpoint,
+    )
     from sglang_omni.utils import find_available_port
     from tests.utils import start_server_from_cmd, stop_server
 
@@ -77,6 +81,7 @@ def deployment(checkpoint, request, tmp_path_factory):
     for key, value in settings.items():
         setattr(direct.sortformer_modules, key, value)
     direct._check_streaming_parameters()
+    native = NemotronDiarizer(checkpoint, device="cuda:0", profile=profile)
     directory = tmp_path_factory.mktemp(f"nemotron_{profile}")
     config = directory / "config.yaml"
     config.write_text(
@@ -86,6 +91,16 @@ def deployment(checkpoint, request, tmp_path_factory):
                 "model_path": checkpoint,
             }
         )
+    )
+    # Enforce the production dependency boundary in the server and its workers,
+    # even though this test process installs NeMo as the parity oracle.
+    (directory / "sitecustomize.py").write_text(
+        "import sys\n"
+        "class RejectNeMo:\n"
+        "    def find_spec(self, fullname, path=None, target=None):\n"
+        "        if fullname == 'nemo' or fullname.startswith('nemo.'):\n"
+        "            raise ImportError('NeMo is unavailable in the native server')\n"
+        "sys.meta_path.insert(0, RejectNeMo())\n"
     )
     port = find_available_port()
     proc = start_server_from_cmd(
@@ -104,15 +119,25 @@ def deployment(checkpoint, request, tmp_path_factory):
         directory / "server.log",
         port,
         timeout=300,
+        env={
+            "PYTHONPATH": os.pathsep.join(
+                [
+                    str(directory),
+                    str(Path(__file__).parents[2]),
+                    os.environ.get("PYTHONPATH", ""),
+                ]
+            )
+        },
     )
     try:
         with httpx.Client(
             base_url=f"http://127.0.0.1:{port}", timeout=180, trust_env=False
         ) as client:
-            yield direct, client
+            yield direct, native, client
     finally:
         stop_server(proc)
         del direct
+        del native
         torch.cuda.empty_cache()
 
 
@@ -147,7 +172,7 @@ def _post(client, audio):
 
 
 def test_http_matches_direct_nemo_and_requests_are_isolated(deployment, recordings):
-    direct, client = deployment
+    direct, native, client = deployment
     expected = {}
     for name, audio in recordings.items():
         waveform = load_audio(audio, target_sample_rate=16000)
@@ -163,6 +188,10 @@ def test_http_matches_direct_nemo_and_requests_are_isolated(deployment, recordin
         assert torch.isfinite(probabilities[0]).all()
         assert probabilities[0].shape[-1] == 8
         assert abs(probabilities[0].shape[1] - len(waveform) / 160) <= 1
+        # Measured on the pinned FP32 runtime: features, attention, speaker-head
+        # output and cache decisions match exactly, including long recordings.
+        actual = native.probabilities(waveform).cpu()
+        torch.testing.assert_close(actual, probabilities[0].cpu(), rtol=0, atol=0)
         duration = len(waveform) / 16000
         segments = [
             {
@@ -194,9 +223,39 @@ def test_http_matches_direct_nemo_and_requests_are_isolated(deployment, recordin
     "audio", [b"", b"not audio", _wav(np.array([], dtype=np.float32))]
 )
 def test_bad_upload_returns_400_and_worker_recovers(deployment, audio):
-    _, client = deployment
+    _, _, client = deployment
     response = client.post("/v1/audio/diarizations", files={"file": ("bad.wav", audio)})
     assert response.status_code == 400, response.text
     assert (
         _post(client, _wav(np.zeros(16000, dtype=np.float32))).json()["segments"] == []
     )
+
+
+def test_native_restore_rejects_incomplete_weights(checkpoint, tmp_path):
+    from sglang_omni.models.nemotron_diarization.backend import (
+        NemotronDiarizer,
+        resolve_nemo_checkpoint,
+    )
+
+    # Keep the real architecture config but omit its weights. This guards a
+    # future strict=False change that would silently serve random layers.
+    with tarfile.open(resolve_nemo_checkpoint(checkpoint)) as archive:
+        config_member = next(
+            m
+            for m in archive.getmembers()
+            if m.name in {"model_config.yaml", "./model_config.yaml"}
+        )
+        config = archive.extractfile(config_member).read()
+    weights = io.BytesIO()
+    torch.save({"unexpected.weight": torch.zeros(1)}, weights)
+    broken = tmp_path / "incomplete.nemo"
+    with tarfile.open(broken, "w") as archive:
+        for name, data in [
+            ("model_config.yaml", config),
+            ("model_weights.ckpt", weights.getvalue()),
+        ]:
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    with pytest.raises(RuntimeError, match="Missing key.*state_dict"):
+        NemotronDiarizer(str(broken), device="cuda:0")

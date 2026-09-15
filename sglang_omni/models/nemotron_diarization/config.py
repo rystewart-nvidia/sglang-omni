@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Offline diarization using NeMo's internally chunked Sortformer inference."""
+"""Offline diarization using native, internally chunked Sortformer inference."""
 
 from typing import ClassVar
 

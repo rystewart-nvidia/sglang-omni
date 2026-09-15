@@ -5,7 +5,10 @@ import msgspec
 import numpy as np
 
 from sglang_omni.client.types import SamplingParams
-from sglang_omni.models.nemotron_diarization.backend import SAMPLE_RATE, NeMoDiarizer
+from sglang_omni.models.nemotron_diarization.backend import (
+    SAMPLE_RATE,
+    NemotronDiarizer,
+)
 from sglang_omni.preprocessing.transcription import resolve_audio_source
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
@@ -21,7 +24,7 @@ def create_diarization_executor(
     profile: str = "offline",
 ) -> SimpleScheduler:
     concrete_device = resolve_concrete_device(device, gpu_id)
-    diarizer = NeMoDiarizer(model_path, device=concrete_device, profile=profile)
+    diarizer = NemotronDiarizer(model_path, device=concrete_device, profile=profile)
     default_params = SamplingParams().to_dict()
     default_params.pop("max_new_tokens")
     default_params["stream"] = False
