@@ -47,21 +47,16 @@ def checkpoint():
     return path
 
 
-@pytest.fixture(
-    scope="module",
-    params=[("offline", 1), ("offline", 2), ("low_latency", 1), ("low_latency", 2)],
-)
-def deployment(checkpoint, request, tmp_path_factory):
+@pytest.fixture(scope="module", params=["offline", "low_latency"])
+def reference_models(checkpoint, request):
     from nemo.collections.asr.models import SortformerEncLabelModel
 
     from sglang_omni.models.nemotron_diarization.backend import (
         NemotronDiarizer,
         resolve_nemo_checkpoint,
     )
-    from sglang_omni.utils import find_available_port
-    from tests.utils import start_server_from_cmd, stop_server
 
-    profile, concurrency = request.param
+    profile = request.param
     # Construct the reference independently from the wrapper's profile table.
     direct = SortformerEncLabelModel.restore_from(
         str(resolve_nemo_checkpoint(checkpoint)), map_location="cuda:0", strict=True
@@ -87,7 +82,20 @@ def deployment(checkpoint, request, tmp_path_factory):
         setattr(direct.sortformer_modules, key, value)
     direct._check_streaming_parameters()
     native = NemotronDiarizer(checkpoint, device="cuda:0", profile=profile)
-    directory = tmp_path_factory.mktemp(f"nemotron_{profile}")
+    yield direct, native, profile
+    del direct
+    del native
+    torch.cuda.empty_cache()
+
+
+@pytest.fixture(scope="module", params=[1, 2])
+def deployment(checkpoint, reference_models, request, tmp_path_factory):
+    from sglang_omni.utils import find_available_port
+    from tests.utils import start_server_from_cmd, stop_server
+
+    direct, native, profile = reference_models
+    concurrency = request.param
+    directory = tmp_path_factory.mktemp(f"nemotron_{profile}_{concurrency}")
     config = directory / "config.yaml"
     config.write_text(
         yaml.safe_dump(
@@ -143,9 +151,6 @@ def deployment(checkpoint, request, tmp_path_factory):
             yield direct, native, client
     finally:
         stop_server(proc)
-        del direct
-        del native
-        torch.cuda.empty_cache()
 
 
 @pytest.fixture(scope="module")
@@ -235,23 +240,27 @@ def test_http_matches_direct_nemo_and_requests_are_isolated(deployment, recordin
 
 
 def test_concurrent_stage_reuses_bounded_workers_and_cuda_streams(
-    deployment, recordings, monkeypatch
+    reference_models, recordings, monkeypatch
 ):
     from sglang_omni.client import Client, GenerateRequest
     from sglang_omni.models.nemotron_diarization import stages
     from sglang_omni.proto import StagePayload
     from sglang_omni.scheduling.messages import IncomingMessage
 
-    _, native, _ = deployment
+    _, native, _ = reference_models
     barrier = threading.Barrier(2, timeout=30)
-    streams = []
     worker_streams = {}
     original = native.diarize
+    expected = {
+        name: msgspec.to_builtins(
+            original(load_audio(recordings[name], target_sample_rate=16000))
+        )
+        for name in ("speech", "silence")
+    }
 
     def simultaneous(waveform):
         stream = torch.cuda.current_stream(native.device).cuda_stream
         worker_streams.setdefault(threading.get_ident(), set()).add(stream)
-        streams.append(stream)
         barrier.wait()
         return original(waveform)
 
@@ -260,13 +269,16 @@ def test_concurrent_stage_reuses_bounded_workers_and_cuda_streams(
     scheduler = stages.create_diarization_executor(
         "unused", device="cuda", gpu_id=0, max_concurrency=2
     )
-    names = ["speech", "silence"]
+    # More queued work than slots catches accidentally raising the worker limit.
+    names = ["speech", "silence", "speech", "silence"]
     thread = threading.Thread(target=scheduler.start, daemon=True)
     thread.start()
-    outputs = []
     try:
-        for _ in range(12):
-            for name in names:
+        for batch in range(6):
+            pending = {}
+            for index, name in enumerate(names):
+                request_id = f"{batch}-{index}"
+                pending[request_id] = expected[name]
                 request = Client._build_omni_request(
                     GenerateRequest(
                         prompt={"audio_bytes": recordings[name]},
@@ -276,29 +288,27 @@ def test_concurrent_stage_reuses_bounded_workers_and_cuda_streams(
                 )
                 scheduler.inbox.put(
                     IncomingMessage(
-                        name,
+                        request_id,
                         "new_request",
-                        StagePayload(request_id=name, request=request, data={}),
+                        StagePayload(request_id=request_id, request=request, data={}),
                     )
                 )
-            outputs.extend(scheduler.outbox.get(timeout=60) for _ in names)
+            for _ in names:
+                output = scheduler.outbox.get(timeout=60)
+                assert output.type == "result", output.data
+                assert output.data.request_id == output.request_id
+                assert output.data.data["diarization"] == pending.pop(output.request_id)
+            assert not pending
     finally:
         barrier.abort()
         scheduler.stop()
         thread.join(timeout=10)
     assert not thread.is_alive()
-    assert len(streams) == 24
     assert len(worker_streams) == 2
     assert all(len(owned) == 1 for owned in worker_streams.values())
-    assert len(set(streams)) == 2
+    streams = set().union(*worker_streams.values())
+    assert len(streams) == 2
     assert torch.cuda.default_stream(native.device).cuda_stream not in streams
-    assert {output.request_id for output in outputs} == set(names)
-    for output in outputs:
-        assert output.type == "result", output.data
-        waveform = load_audio(recordings[output.request_id], target_sample_rate=16000)
-        assert output.data.data["diarization"] == msgspec.to_builtins(
-            original(waveform)
-        )
 
 
 @pytest.mark.parametrize(

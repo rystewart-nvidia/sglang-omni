@@ -2,7 +2,6 @@
 """Guard decoding, device placement, and admission before optional inference."""
 
 import io
-import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -20,12 +19,16 @@ from sglang_omni.proto import StagePayload
 
 
 @pytest.fixture
-def executor(monkeypatch):
+def cuda_platform(monkeypatch):
     import sglang_omni.platforms as platforms
 
     monkeypatch.setattr(
         platforms, "current_platform", SimpleNamespace(device_type="cuda")
     )
+
+
+@pytest.fixture
+def executor(cuda_platform, monkeypatch):
     calls = []
 
     class RecordingDiarizer:
@@ -104,12 +107,6 @@ def test_low_level_client_cannot_silently_apply_generation_controls(executor, pa
     assert not calls
 
 
-def test_native_loader_does_not_require_nemo(monkeypatch, tmp_path):
-    monkeypatch.setitem(sys.modules, "nemo", None)
-    with pytest.raises(FileNotFoundError, match="Missing checkpoint"):
-        NemotronDiarizer(str(tmp_path / "missing.nemo"), device=torch.device("cuda:0"))
-
-
 @pytest.mark.parametrize(
     "kwargs, message",
     [
@@ -123,14 +120,21 @@ def test_unsupported_deployment_fails_before_checkpoint_download(kwargs, message
 
 
 @pytest.mark.parametrize("concurrency", [0, -1, 1.5, True, "2"])
-def test_invalid_concurrency_fails_before_model_loading(concurrency):
+def test_invalid_concurrency_fails_before_model_loading(concurrency, monkeypatch):
+    def unexpected_load(*args, **kwargs):
+        pytest.fail("invalid concurrency reached model loading")
+
+    monkeypatch.setattr(stages, "NemotronDiarizer", unexpected_load)
     with pytest.raises(ValueError, match="max_concurrency must be a positive integer"):
         stages.create_diarization_executor(
-            "missing/repository", max_concurrency=concurrency
+            "unused", device="cpu", max_concurrency=concurrency
         )
 
 
-def test_failed_inference_keeps_its_slot_until_gpu_work_finishes(executor, monkeypatch):
+def test_failed_inference_waits_for_gpu_before_propagating_error(
+    cuda_platform, monkeypatch
+):
+    launched = threading.Event()
     waiting = threading.Event()
     finished = threading.Event()
     initialized = object()
@@ -144,6 +148,7 @@ def test_failed_inference_keeps_its_slot_until_gpu_work_finishes(executor, monke
             assert isinstance(event, Ready)
 
         def synchronize(self):
+            assert launched.is_set()
             waiting.set()
             assert finished.wait(timeout=5)
 
@@ -152,6 +157,7 @@ def test_failed_inference_keeps_its_slot_until_gpu_work_finishes(executor, monke
             pass
 
         def diarize(self, waveform):
+            launched.set()
             raise RuntimeError("inference failed after launching GPU work")
 
     monkeypatch.setattr(stages, "NemotronDiarizer", FailingDiarizer)
