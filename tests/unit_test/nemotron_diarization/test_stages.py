@@ -3,6 +3,9 @@
 
 import io
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
@@ -117,3 +120,54 @@ def test_native_loader_does_not_require_nemo(monkeypatch, tmp_path):
 def test_unsupported_deployment_fails_before_checkpoint_download(kwargs, message):
     with pytest.raises(ValueError, match=message):
         NemotronDiarizer("missing/repository", **kwargs)
+
+
+@pytest.mark.parametrize("concurrency", [0, -1, 1.5, True, "2"])
+def test_invalid_concurrency_fails_before_model_loading(concurrency):
+    with pytest.raises(ValueError, match="max_concurrency must be a positive integer"):
+        stages.create_diarization_executor(
+            "missing/repository", max_concurrency=concurrency
+        )
+
+
+def test_failed_inference_keeps_its_slot_until_gpu_work_finishes(executor, monkeypatch):
+    waiting = threading.Event()
+    finished = threading.Event()
+    initialized = object()
+
+    class Ready:
+        def record(self, stream):
+            assert stream is initialized
+
+    class Stream:
+        def wait_event(self, event):
+            assert isinstance(event, Ready)
+
+        def synchronize(self):
+            waiting.set()
+            assert finished.wait(timeout=5)
+
+    class FailingDiarizer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def diarize(self, waveform):
+            raise RuntimeError("inference failed after launching GPU work")
+
+    monkeypatch.setattr(stages, "NemotronDiarizer", FailingDiarizer)
+    monkeypatch.setattr(torch.cuda, "Event", Ready)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: initialized)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda device: Stream())
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    scheduler = stages.create_diarization_executor(
+        "unused", device="cuda", gpu_id=3, max_concurrency=2
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(scheduler._fn, payload(wav(np.zeros(1600), 16000)))
+        try:
+            assert waiting.wait(timeout=5)
+            assert not future.done()
+        finally:
+            finished.set()
+        with pytest.raises(RuntimeError, match="inference failed"):
+            future.result(timeout=5)

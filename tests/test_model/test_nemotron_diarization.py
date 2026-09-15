@@ -11,10 +11,12 @@ import io
 import os
 import sys
 import tarfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
+import msgspec
 import numpy as np
 import pytest
 import soundfile as sf
@@ -45,7 +47,10 @@ def checkpoint():
     return path
 
 
-@pytest.fixture(scope="module", params=["offline", "low_latency"])
+@pytest.fixture(
+    scope="module",
+    params=[("offline", 1), ("offline", 2), ("low_latency", 1), ("low_latency", 2)],
+)
 def deployment(checkpoint, request, tmp_path_factory):
     from nemo.collections.asr.models import SortformerEncLabelModel
 
@@ -56,7 +61,7 @@ def deployment(checkpoint, request, tmp_path_factory):
     from sglang_omni.utils import find_available_port
     from tests.utils import start_server_from_cmd, stop_server
 
-    profile = request.param
+    profile, concurrency = request.param
     # Construct the reference independently from the wrapper's profile table.
     direct = SortformerEncLabelModel.restore_from(
         str(resolve_nemo_checkpoint(checkpoint)), map_location="cuda:0", strict=True
@@ -113,6 +118,8 @@ def deployment(checkpoint, request, tmp_path_factory):
             str(config),
             "--diarization.factory.profile",
             profile,
+            "--diarization.factory.max_concurrency",
+            str(concurrency),
             "--port",
             str(port),
         ],
@@ -173,6 +180,12 @@ def _post(client, audio):
 
 def test_http_matches_direct_nemo_and_requests_are_isolated(deployment, recordings):
     direct, native, client = deployment
+    # The first requests also exercise compilation from concurrent worker threads.
+    initial_names = ["cache_updates", "speech"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        initial_responses = list(
+            pool.map(lambda name: _post(client, recordings[name]), initial_names)
+        )
     expected = {}
     for name, audio in recordings.items():
         waveform = load_audio(audio, target_sample_rate=16000)
@@ -208,8 +221,10 @@ def test_http_matches_direct_nemo_and_requests_are_isolated(deployment, recordin
         expected[name] = {"duration": duration, "segments": segments}
         assert _post(client, audio).json() == expected[name]
     assert expected["silence"]["segments"] == []
-    # Speech -> silence -> speech guards state leakage, including queued requests.
-    names = ["speech", "silence", "speech"]
+    for name, response in zip(initial_names, initial_responses):
+        assert response.json() == expected[name]
+    # Mixed lengths exercise separate caches, multiple chunks and queued work.
+    names = ["cache_updates", "silence", "partial_tail", "speech", "cache_updates"]
     with ThreadPoolExecutor(max_workers=3) as pool:
         responses = list(pool.map(lambda name: _post(client, recordings[name]), names))
     assert len({response.headers["x-request-id"] for response in responses}) == len(
@@ -217,6 +232,73 @@ def test_http_matches_direct_nemo_and_requests_are_isolated(deployment, recordin
     )
     for name, response in zip(names, responses):
         assert response.json() == expected[name]
+
+
+def test_concurrent_stage_reuses_bounded_workers_and_cuda_streams(
+    deployment, recordings, monkeypatch
+):
+    from sglang_omni.client import Client, GenerateRequest
+    from sglang_omni.models.nemotron_diarization import stages
+    from sglang_omni.proto import StagePayload
+    from sglang_omni.scheduling.messages import IncomingMessage
+
+    _, native, _ = deployment
+    barrier = threading.Barrier(2, timeout=30)
+    streams = []
+    worker_streams = {}
+    original = native.diarize
+
+    def simultaneous(waveform):
+        stream = torch.cuda.current_stream(native.device).cuda_stream
+        worker_streams.setdefault(threading.get_ident(), set()).add(stream)
+        streams.append(stream)
+        barrier.wait()
+        return original(waveform)
+
+    monkeypatch.setattr(native, "diarize", simultaneous)
+    monkeypatch.setattr(stages, "NemotronDiarizer", lambda *args, **kwargs: native)
+    scheduler = stages.create_diarization_executor(
+        "unused", device="cuda", gpu_id=0, max_concurrency=2
+    )
+    names = ["speech", "silence"]
+    thread = threading.Thread(target=scheduler.start, daemon=True)
+    thread.start()
+    outputs = []
+    try:
+        for _ in range(12):
+            for name in names:
+                request = Client._build_omni_request(
+                    GenerateRequest(
+                        prompt={"audio_bytes": recordings[name]},
+                        stream=False,
+                        metadata={"task": "diarization"},
+                    )
+                )
+                scheduler.inbox.put(
+                    IncomingMessage(
+                        name,
+                        "new_request",
+                        StagePayload(request_id=name, request=request, data={}),
+                    )
+                )
+            outputs.extend(scheduler.outbox.get(timeout=60) for _ in names)
+    finally:
+        barrier.abort()
+        scheduler.stop()
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert len(streams) == 24
+    assert len(worker_streams) == 2
+    assert all(len(owned) == 1 for owned in worker_streams.values())
+    assert len(set(streams)) == 2
+    assert torch.cuda.default_stream(native.device).cuda_stream not in streams
+    assert {output.request_id for output in outputs} == set(names)
+    for output in outputs:
+        assert output.type == "result", output.data
+        waveform = load_audio(recordings[output.request_id], target_sample_rate=16000)
+        assert output.data.data["diarization"] == msgspec.to_builtins(
+            original(waveform)
+        )
 
 
 @pytest.mark.parametrize(

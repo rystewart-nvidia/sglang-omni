@@ -15,7 +15,7 @@ class NemotronDiarizationPipelineConfig(PipelineConfig):
             name="diarization",
             process="diarization",
             factory_path="sglang_omni.models.nemotron_diarization.stages.create_diarization_executor",
-            factory=FactoryArgs(profile="offline"),
+            factory=FactoryArgs(profile="offline", max_concurrency=1),
             gpu=0,
             terminal=True,
         )

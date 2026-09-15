@@ -14,7 +14,9 @@ NeMo is not required to serve the model.
 
 ## Server Configuration
 
-The model runs on one GPU with FP32 weights and processes one recording at a time.
+The model runs on one GPU with FP32 weights. By default, it processes one
+recording at a time, but you can increase concurrency with `max_concurrency`
+(see [Concurrent Requests](#concurrent-requests)).
 
 ```bash
 sgl-omni serve --config examples/configs/nemotron_diarization.yaml --port 8000
@@ -86,13 +88,27 @@ Both profiles accept a complete recording and return one response after
 processing finishes. The `low_latency` setting changes the model's chunking;
 it does not enable live audio input or streamed HTTP responses.
 
+## Concurrent Requests
+
+To process multiple recordings at once, increase `max_concurrency`. For example:
+
+```bash
+sgl-omni serve --config examples/configs/nemotron_diarization.yaml \
+    --diarization.factory.max_concurrency 2 --port 8000
+```
+
+Active requests share model weights and use separate speaker caches and CUDA
+streams. Additional requests wait in the queue. Increasing concurrency uses more
+GPU memory; check memory use and throughput with your recording lengths before
+raising the limit. Both inference profiles support this setting.
+
 ## Known Limitations
 
 - Up to eight speakers per recording. Audio with more speakers is still accepted,
   but the model cannot assign a separate label to each person.
-- One recording is processed at a time; concurrent requests are queued.
+- Active recordings are limited by `max_concurrency`, which defaults to `1`.
 - Disconnecting a client discards its result. An inference call already in
-  progress finishes before the worker starts the next recording.
+  progress finishes before its worker starts another recording.
 
 ## Tests
 
