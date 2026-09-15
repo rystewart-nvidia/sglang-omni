@@ -1,75 +1,48 @@
 # Nemotron 3 Diarization
 
-Serve [NVIDIA Nemotron 3 Diarization preview](https://huggingface.co/nvidia/Nemotron-3-Diarization-preview)
-through an offline audio-upload endpoint. The model identifies up to eight
-speakers and returns their active intervals, including overlapping speech.
-Speaker labels are local to each recording. It does not produce transcripts.
+[NVIDIA Nemotron 3 Diarization preview](https://huggingface.co/nvidia/Nemotron-3-Diarization-preview)
+is a Sortformer model that identifies up to eight speakers in a recording,
+including overlapping speech. SGLang-Omni serves it through
+`/v1/audio/diarizations`, which returns speaker labels and timestamps.
+Use a separate ASR model if you also need a transcript.
 
-## Install
+## Prerequisites
 
-Use an NVIDIA GPU, Python 3.12, and the normal SGLang-Omni system dependencies
-(including FFmpeg for compressed audio). Install Omni from the checkout:
+Install `sglang-omni` by following [Installation](../get_started/installation.md).
+Use an NVIDIA GPU and Python 3.12, with FFmpeg installed for compressed audio.
+NeMo is not required to serve the model.
 
-```bash
-uv pip install --prerelease=allow -e .
-```
+## Server Configuration
 
-Inference uses native PyTorch modules and does not require NeMo. The loader reads
-`model_config.yaml` with `yaml.safe_load` and loads the tensor state dictionary
-from `model_weights.ckpt` with `torch.load(weights_only=True)`. It does not
-instantiate YAML targets or extract archive paths. Unsupported architecture or
-preprocessing settings and missing/unexpected weights fail at startup.
-
-The preview checkpoint is gated. Obtain access on its Hugging Face page and
-configure your Hugging Face authentication before starting the server. Its
-NVIDIA evaluation license governs model use and disclosure of evaluation results.
-
-## Launch
+The model runs on one GPU with FP32 weights and processes one recording at a time.
 
 ```bash
 sgl-omni serve --config examples/configs/nemotron_diarization.yaml --port 8000
 ```
 
-The example pins the checkpoint revision and explicitly selects
-`NemotronDiarizationPipelineConfig`. Automatic discovery using only
-`--model-path` is not supported for this archive layout. In the YAML file,
-`model_path` may also name a local `.nemo` file or a directory containing
-`Nemotron-3-Diarization-preview.nemo`.
+The example downloads a pinned checkpoint revision. To use a local checkpoint,
+set `model_path` in your YAML configuration:
 
-One GPU runs a serial `SimpleScheduler` stage. It restores the checkpoint with
-strict weight matching and uses FP32 inference. Incoming audio is decoded,
-downmixed, and resampled to 16 kHz using the shared audio utilities.
-
-The default `offline` profile processes the recording in internal
-chunks, retaining speaker-cache state across those chunks. A smaller internal
-buffer is available with:
-
-```bash
-sgl-omni serve --config examples/configs/nemotron_diarization.yaml \
-    --diarization.factory.profile low_latency --port 8000
+```yaml
+config_cls: NemotronDiarizationPipelineConfig
+model_path: /path/to/Nemotron-3-Diarization-preview.nemo
 ```
 
-Both profiles return a single response after the recording completes. They do
-not enable live audio input or streamed HTTP results. Concurrent uploads are
-queued to bound GPU memory. Each recording owns fresh speaker-cache state.
-Cancelling a request discards its result; an already-running inference call
-finishes before the worker can accept another recording.
+You can also point `model_path` to a directory containing that file. Use
+`--config` for this model; automatic discovery with `--model-path` alone does
+not support the `.nemo` archive.
 
-The model has eight speaker channels. Recordings with nine or more speakers
-are outside its supported capacity; the service cannot determine the true
-speaker count and does not detect or reject such recordings automatically.
+## Diarize Audio
 
-## Request
-
-`POST /v1/audio/diarizations` is an Omni extension. Upload audio using multipart
-form data:
+Upload a recording as multipart form data. The server converts it to mono and
+resamples it to 16 kHz.
 
 ```bash
 curl http://localhost:8000/v1/audio/diarizations \
     -F file=@conversation.wav
 ```
 
-The response schema is:
+Example response:
 
 ```json
 {
@@ -81,70 +54,62 @@ The response schema is:
 }
 ```
 
-This is an illustrative response, not an evaluation result. Times are seconds
-from the start of the recording. Intervals are ordered by start time and may
-overlap; silence returns an empty `segments` list. The model emits predictions
-at 10 ms resolution. Speaker-cache/chunk settings use 80 ms units instead.
+Times are seconds from the start of the recording, with 10 ms frame resolution.
+Segments are sorted by start time and can overlap when speakers talk at once.
+Silence returns an empty `segments` list. Speaker labels belong to each
+recording: `speaker_0` in one request is not necessarily the same person as
+`speaker_0` in another.
 
-Optional form fields are `model` (the exact served model name),
-`response_format=json`, and `stream=false`. Transcription prompts, language
-selection, generation parameters, and other response formats are unsupported
-and rejected. Use a separate ASR model if a transcript is also needed.
+## Request Parameters
 
-## Implementation boundary
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `file` | file | required | Audio file uploaded as multipart form data |
+| `model` | string | server default | Must match the served model name if provided |
+| `response_format` | string | `json` | Only `json` is supported |
+| `stream` | boolean | `false` | Only `false` is supported |
 
-`models/nemotron_diarization/backend.py` owns archive loading and interval
-postprocessing; `model.py` implements the encoder and speaker head, and
-`speaker_cache.py` retains arrival-order speaker context. `stages.py` owns the
-Omni request boundary. The client and HTTP schema are unchanged from the NeMo
-wrapper baseline.
+`/v1/audio/diarizations` is a SGLang-Omni extension. It rejects transcription
+prompts, language selection, speaker-count overrides, and generation parameters.
 
-The inference math is adapted from Apache-2.0 NVIDIA-NeMo/Speech revision
-`2c1a2f91d64566b5d391b83df42f9ab4cd810adb`. The implementation supports this
-published FP32 checkpoint, with PyTorch FlexAttention and 10 ms output frames.
-The cache/FIFO/chunk settings use 80 ms encoder frames:
+## Inference Profiles
 
-| Profile | Speaker cache | FIFO | Chunk | Right context | Cache update period |
-| --- | --- | --- | --- | --- | --- |
-| `offline` | 264 | 40 | 340 | 40 | 300 |
-| `low_latency` | 264 | 264 | 9 | 4 | 222 |
+The default `offline` profile processes audio in chunks while keeping speaker
+context across the recording. To use smaller chunks, select `low_latency`:
 
-## Validation
+```bash
+sgl-omni serve --config examples/configs/nemotron_diarization.yaml \
+    --diarization.factory.profile low_latency --port 8000
+```
 
-Run the CPU unit tests with the normal repository test dependencies:
+Both profiles accept a complete recording and return one response after
+processing finishes. The `low_latency` setting changes the model's chunking;
+it does not enable live audio input or streamed HTTP responses.
+
+## Known Limitations
+
+- Up to eight speakers per recording. Audio with more speakers is still accepted,
+  but the model cannot assign a separate label to each person.
+- One recording is processed at a time; concurrent requests are queued.
+- Disconnecting a client discards its result. An inference call already in
+  progress finishes before the worker starts the next recording.
+
+## Tests
+
+Run the CPU tests for checkpoint validation, timestamp handling, and the endpoint:
 
 ```bash
 pytest tests/unit_test/nemotron_diarization tests/unit_test/serve/test_diarizations.py
 ```
 
-Parity tests use NeMo as a development-only reference. Install the pinned
-source in your test environment before running them:
-
-```bash
-NEMO_SOURCE=/path/to/persistent/NeMo-Speech
-git clone https://github.com/NVIDIA-NeMo/Speech.git "$NEMO_SOURCE"
-git -C "$NEMO_SOURCE" checkout 2c1a2f91d64566b5d391b83df42f9ab4cd810adb
-uv pip install --prerelease=allow -e . -e "${NEMO_SOURCE}[asr]"
-```
-
-Run the opt-in integration tests with a locally available checkpoint:
+The GPU integration tests in `tests/test_model/test_nemotron_diarization.py`
+compare both profiles with NeMo and exercise real HTTP requests. They require a
+local checkpoint and the ASR dependencies from
+[the pinned NeMo source](https://github.com/NVIDIA-NeMo/Speech/tree/2c1a2f91d64566b5d391b83df42f9ab4cd810adb).
 
 ```bash
 NEMOTRON_DIARIZATION_CHECKPOINT=/path/to/checkpoint \
   python -m pytest tests/test_model/test_nemotron_diarization.py -q
 ```
 
-These tests launch real HTTP servers for both profiles with NeMo imports
-blocked in the server processes. They compare native frame probabilities and
-HTTP intervals exactly with direct NeMo using identical preprocessing. They cover silence, malformed
-and empty audio, stereo/resampling, partial final frames, cache updates in a
-67-second recording, and sequential/concurrent request isolation. Set
-`NEMOTRON_DIARIZATION_AUDIO_DIR` to include additional permitted WAV recordings.
-
-A passing parity test establishes integration behavior, not diarization
-accuracy. For accuracy evaluation, use permitted speaker-annotated recordings,
-declare the DER scoring collar and overlap policy, and measure latency and
-memory separately. Score recordings beyond eight speakers separately as outside
-the supported model capacity. Retain gated model evaluation artifacts outside
-public changes; small fixture checks do not establish corpus-wide accuracy or
-throughput.
+Set `NEMOTRON_DIARIZATION_AUDIO_DIR` to include additional WAV recordings in the tests.
