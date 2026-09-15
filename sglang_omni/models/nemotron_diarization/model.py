@@ -200,25 +200,25 @@ class NemotronDiarizationModel(nn.Module):
         for start in range(0, features.shape[2], chunk_size * 8):
             end = min(start + chunk_size * 8, features.shape[2])
             right = min(right_context * 8, features.shape[2] - end)
-            chunk = self.encoder.pre_encode(features[:, :, start : end + right])
-            chunk_valid = (max(0, min(length - start, end + right - start)) + 7) // 8
-            prefix_length = state.cache.shape[1] + state.fifo.shape[1]
-            embeddings = torch.cat([state.cache, state.fifo, chunk], dim=1)
-            valid_length = prefix_length + chunk_valid
-            encoded = self.encoder(embeddings, valid_length)
-            predictions = self.sortformer_modules(encoded, valid_length)
-            count = chunk.shape[1] - (right + 7) // 8
             outputs.append(
-                predictions[:, prefix_length * 8 : (prefix_length + count) * 8]
-            )
-            low_resolution = F.avg_pool1d(predictions.transpose(1, 2), 8, 8).transpose(
-                1, 2
-            )
-            state.update(
-                chunk[:, :count],
-                low_resolution,
-                self.sortformer_modules.learnable_sil_emb,
+                self.forward_chunk(features[:, :, start : end + right], state, right)
             )
         predictions = torch.cat(outputs, dim=1)[:, : features.shape[2]]
         predictions[:, length:] = 0
         return predictions
+
+    def forward_chunk(self, features, state: SpeakerCache, right: int):
+        """Advance one recording's cache; right context is in 10 ms frames."""
+        chunk = self.encoder.pre_encode(features)
+        prefix_length = state.cache.shape[1] + state.fifo.shape[1]
+        embeddings = torch.cat([state.cache, state.fifo, chunk], dim=1)
+        valid_length = prefix_length + (features.shape[2] + 7) // 8
+        encoded = self.encoder(embeddings, valid_length)
+        predictions = self.sortformer_modules(encoded, valid_length)
+        count = chunk.shape[1] - (right + 7) // 8
+        output = predictions[:, prefix_length * 8 : (prefix_length + count) * 8]
+        low_resolution = F.avg_pool1d(predictions.transpose(1, 2), 8, 8).transpose(1, 2)
+        state.update(
+            chunk[:, :count], low_resolution, self.sortformer_modules.learnable_sil_emb
+        )
+        return output

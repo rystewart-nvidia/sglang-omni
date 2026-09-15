@@ -8,7 +8,7 @@ import logging
 import uuid
 
 import msgspec
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
 from fastapi.responses import JSONResponse
 
 from sglang_omni.client import Client, GenerateRequest
@@ -45,6 +45,34 @@ async def complete_diarization(
 
 
 def register_diarizations(app: FastAPI) -> None:
+    @app.websocket("/v1/audio/diarizations/stream")
+    async def live_diarization(websocket: WebSocket) -> None:
+        from sglang_omni.serve.diarization_ws import DiarizationSession
+
+        await websocket.accept()
+        if not _SUPPORTED_ARCHITECTURES.intersection(app.state.architectures or []):
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "message": "This model does not support standalone diarization",
+                }
+            )
+            await websocket.close(code=1008)
+            return
+        health = app.state.client.health()
+        if health["stages"] != [health["entry_stage"]]:
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "message": "Live diarization requires a single-stage pipeline without process replicas",
+                }
+            )
+            await websocket.close(code=1008)
+            return
+        await DiarizationSession(
+            websocket, client=app.state.client, model_name=app.state.model_name
+        ).run()
+
     @app.post("/v1/audio/diarizations")
     async def create_diarization(
         request: Request,

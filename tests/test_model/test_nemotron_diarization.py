@@ -351,3 +351,127 @@ def test_native_restore_rejects_incomplete_weights(checkpoint, tmp_path):
             archive.addfile(info, io.BytesIO(data))
     with pytest.raises(RuntimeError, match="Missing key.*state_dict"):
         NemotronDiarizer(str(broken), device="cuda:0")
+
+
+@pytest.mark.parametrize("reference_models", ["low_latency"], indirect=True)
+def test_live_probabilities_match_nemo_across_message_boundaries(
+    reference_models, recordings
+):
+    from sglang_omni.models.nemotron_diarization.streaming import LiveDiarization
+
+    direct, native, _ = reference_models
+    names = ["cache_updates", "speech", "silence", "partial_tail"]
+    names.extend(name for name in recordings if name.endswith(".wav"))
+    for name in names:
+        waveform = load_audio(recordings[name], target_sample_rate=16000)
+        _, reference = direct.diarize(
+            audio=[waveform],
+            sample_rate=16000,
+            batch_size=1,
+            include_tensor_outputs=True,
+            num_workers=0,
+            verbose=False,
+        )
+        # Uneven network messages must not become acoustic chunk boundaries.
+        stream = LiveDiarization(native.model, device=native.device)
+        chunks = []
+        for offset in range(0, len(waveform), 1777):
+            chunks.append(stream.probabilities(waveform[offset : offset + 1777]).cpu())
+            assert stream.audio.size < 104 * 160 + 256 + 320
+            assert stream.state.cache.shape[1] <= 264
+            assert stream.state.fifo.shape[1] <= 264
+        if len(waveform) > 17000:
+            assert sum(chunk.shape[1] for chunk in chunks) > 0
+        chunks.append(stream.probabilities(np.empty(0, np.float32), final=True).cpu())
+        torch.testing.assert_close(
+            torch.cat(chunks, dim=1), reference[0].cpu(), rtol=0, atol=0
+        )
+
+
+def _merge_live_segments(updates):
+    merged = []
+    for speaker in range(8):
+        intervals = [
+            s
+            for update in updates
+            for s in update["segments"]
+            if s["speaker"] == f"speaker_{speaker}"
+        ]
+        for segment in intervals:
+            if (
+                merged
+                and merged[-1]["speaker"] == segment["speaker"]
+                and merged[-1]["end"] == segment["start"]
+            ):
+                merged[-1]["end"] = segment["end"]
+            else:
+                merged.append(dict(segment))
+    return sorted(merged, key=lambda s: (s["start"], s["end"], s["speaker"]))
+
+
+@pytest.mark.parametrize("reference_models", ["low_latency"], indirect=True)
+def test_live_websocket_interleaves_recordings_and_recovers(deployment, recordings):
+    import json
+
+    from websockets.sync.client import connect
+
+    from tests.utils import disable_proxy
+
+    _, native, client = deployment
+    url = (
+        str(client.base_url).replace("http://", "ws://").rstrip("/")
+        + "/v1/audio/diarizations/stream"
+    )
+    inputs = []
+    for name in ("speech", "partial_tail", "silence"):
+        waveform = load_audio(recordings[name], target_sample_rate=16000)
+        pcm = np.clip(np.rint(waveform * 32768), -32768, 32767).astype("<i2")
+        expected = msgspec.to_builtins(native.diarize(pcm.astype(np.float32) / 32768))
+        inputs.append((pcm.tobytes(), expected))
+
+    barrier = threading.Barrier(len(inputs), timeout=60)
+
+    def run(case):
+        pcm, expected = case
+        updates = []
+        with connect(url, open_timeout=30) as ws:
+            ready = json.loads(ws.recv(timeout=60))
+            assert ready["type"] == "session.ready"
+            barrier.wait()
+            for offset in range(0, len(pcm), 3200):
+                ws.send(pcm[offset : offset + 3200])
+                while True:
+                    event = json.loads(ws.recv(timeout=60))
+                    if event["type"] == "audio.ack":
+                        break
+                    assert event["type"] == "diarization.update", event
+                    assert event["start"] == (updates[-1]["end"] if updates else 0)
+                    updates.append(event)
+            if len(pcm) >= 2 * (104 * 160 + 256):
+                assert updates  # Results arrive before audio.end.
+            else:
+                assert not updates  # Short recordings need the final lookahead flush.
+            ws.send(json.dumps({"type": "audio.end"}))
+            while True:
+                event = json.loads(ws.recv(timeout=60))
+                if event["type"] == "diarization.done":
+                    assert event["duration"] == expected["duration"]
+                    break
+                assert event["type"] == "diarization.update", event
+                assert event["start"] == (updates[-1]["end"] if updates else 0)
+                updates.append(event)
+        assert _merge_live_segments(updates) == expected["segments"]
+        return ready["session_id"]
+
+    with disable_proxy(), ThreadPoolExecutor(max_workers=len(inputs)) as pool:
+        ids = list(pool.map(run, inputs))
+    assert len(set(ids)) == len(inputs)
+    # More than the session limit over time: both protocol errors and ordinary
+    # disconnects must release capacity, rather than accumulating stale sessions.
+    for index in range(10):
+        with disable_proxy(), connect(url, open_timeout=30) as ws:
+            assert json.loads(ws.recv(timeout=60))["type"] == "session.ready"
+            ws.send(b"x" if index % 2 else inputs[0][0][:3200])
+            event = json.loads(ws.recv(timeout=60))
+            assert event["type"] == ("error" if index % 2 else "audio.ack")
+    assert _post(client, recordings["speech"]).status_code == 200

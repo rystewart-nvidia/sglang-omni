@@ -15,7 +15,7 @@ NeMo is not required to serve the model.
 ## Server Configuration
 
 The model runs on one GPU with FP32 weights. By default, it processes one
-recording at a time, but you can increase concurrency with `max_concurrency`
+uploaded recording at a time, but you can increase concurrency with `max_concurrency`
 (see [Concurrent Requests](#concurrent-requests)).
 
 ```bash
@@ -86,7 +86,7 @@ sgl-omni serve --config examples/configs/nemotron_diarization.yaml \
 
 Both profiles accept a complete recording and return one response after
 processing finishes. The `low_latency` setting changes the model's chunking;
-it does not enable live audio input or streamed HTTP responses.
+use the WebSocket endpoint below for live audio input.
 
 ## Concurrent Requests
 
@@ -102,20 +102,90 @@ streams. Additional requests wait in the queue. Increasing concurrency uses more
 GPU memory; check memory use and throughput with your recording lengths before
 raising the limit. Both inference profiles support this setting.
 
+## Live Audio
+
+Use `/v1/audio/diarizations/stream` to send microphone audio over a WebSocket.
+The same server command supports both uploads and live sessions. Live sessions
+always use the low-latency profile: 720 ms chunks with 320 ms of lookahead,
+plus a small amount of audio context for feature extraction. The first update
+needs about 1.06 seconds of audio, plus inference and network time.
+
+On your laptop, install the client dependencies and run the example:
+
+```bash
+pip install websockets sounddevice
+python examples/nemotron_diarization_live.py --seconds 30
+```
+
+Allow microphone access if your operating system asks. The client prints speaker
+labels and timestamps as you speak, then flushes the last audio when the recording
+ends. To reach a remote server, forward its port with SSH:
+
+```bash
+ssh -N -L 8000:localhost:8000 user@gpu-host
+```
+
+You can also replay a recording at its original speed:
+
+```bash
+ffmpeg -i conversation.wav -ar 16000 -ac 1 -c:a pcm_s16le live.wav
+python examples/nemotron_diarization_live.py --file live.wav
+```
+
+### WebSocket Protocol
+
+Wait for `session.ready`, then send binary messages containing mono, 16 kHz,
+little-endian signed PCM16 samples. Each message can contain up to one second of
+audio (32,000 bytes). The microphone example captures 100 ms blocks and combines
+queued blocks into messages of up to one second when catching up after a delay.
+Its local buffer holds up to five seconds of audio before reporting an error.
+Wait for `audio.ack`
+after each message to avoid outrunning the server. These messages contain raw
+samples, without a WAV header.
+
+| Event | Direction | Meaning |
+| --- | --- | --- |
+| `session.ready` | server → client | Session ID and accepted audio format |
+| `diarization.update` | server → client | New finalized time range (`start`, `end`) and its `segments` |
+| `audio.ack` | server → client | Audio accepted; `processed_until` is the finalized timestamp |
+| `audio.end` | client → server | Flush remaining audio and finish the recording |
+| `diarization.done` | server → client | Final recording duration; the server then closes the socket |
+| `session.reset` | client → server | Discard buffered audio and speaker state; start a new recording |
+| `error` | server → client | Error message; the server then closes the socket |
+
+Send control events as JSON, for example `{"type": "audio.end"}`. Updates contain
+absolute timestamps from the start of the session and preserve overlapping
+speakers. A speaker interval can continue in the next update; concatenate adjacent
+intervals with the same speaker if you need a full-recording timeline. Earlier
+updates are not revised. Silence produces updates with empty segment lists.
+A reset returns a new `session.ready` and restarts timestamps and speaker labels.
+Disconnecting releases the session, including any buffered audio.
+
+The server keeps up to eight live sessions by default. Increase
+`--diarization.factory.max_live_sessions` to change that limit. Each session keeps
+its own bounded audio buffer and speaker cache while sharing model weights.
+Live sessions use the single-stage pipeline in the example configuration; process
+replicas are not supported for this endpoint.
+`max_concurrency` controls simultaneous inference work across uploads and live
+chunks; it is separate from the number of open sessions. A connection idle for
+60 seconds is closed. The server rejects excess queued audio instead of dropping
+samples, so timestamps remain aligned with the audio you sent.
+
 ## Known Limitations
 
 - Up to eight speakers per recording. Audio with more speakers is still accepted,
   but the model cannot assign a separate label to each person.
-- Active recordings are limited by `max_concurrency`, which defaults to `1`.
-- Disconnecting a client discards its result. An inference call already in
-  progress finishes before its worker starts another recording.
+- Simultaneous inference work is limited by `max_concurrency`, which defaults to `1`.
+- Disconnecting a client discards pending results and releases its live session.
+  An inference call already in progress finishes before its worker starts more work.
 
 ## Tests
 
 Run the CPU tests for checkpoint validation, timestamp handling, and the endpoint:
 
 ```bash
-pytest tests/unit_test/nemotron_diarization tests/unit_test/serve/test_diarizations.py
+pytest tests/unit_test/nemotron_diarization tests/unit_test/serve/test_diarizations.py \
+    tests/unit_test/serve/test_diarization_ws.py
 ```
 
 The GPU integration tests in `tests/test_model/test_nemotron_diarization.py`
