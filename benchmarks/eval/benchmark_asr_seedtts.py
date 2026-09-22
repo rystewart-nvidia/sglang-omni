@@ -111,6 +111,7 @@ from benchmarks.tasks.asr import (
     build_asr_eval_results,
     run_asr_transcription,
 )
+from benchmarks.tasks.diarization import build_diarization_evaluation, run_diarization
 
 DEFAULT_CONCURRENCIES = "1,2,4,8,16,32,64"
 
@@ -223,29 +224,34 @@ async def run_asr_seedtts_once(
     warmup: int = 0,
     disable_tqdm: bool = True,
     stream: bool = False,
+    task: str = "transcribe",
 ) -> dict:
     """Run one SeedTTS ASR benchmark pass and return WER/speed/worker metrics."""
     before = _fetch_worker_snapshot(host, port)
-    outputs, wall_clock_s = await run_asr_transcription(
+    run = run_diarization if task == "diarize" else run_asr_transcription
+    outputs, wall_clock_s = await run(
         samples,
         host=host,
         port=port,
         model_path=model_path,
-        lang=lang,
         concurrency=concurrency,
         warmup=warmup,
         disable_tqdm=disable_tqdm,
         stream=stream,
+        **({} if task == "diarize" else {"lang": lang}),
     )
+    if task == "diarize":
+        benchmark_result = build_diarization_evaluation(samples, outputs, wall_clock_s)
+    else:
+        benchmark_result = build_asr_eval_results(
+            samples,
+            outputs,
+            wall_clock_s,
+            lang,
+            model_path=model_path,
+            concurrency=concurrency,
+        )
     after = _fetch_worker_snapshot(host, port)
-    benchmark_result = build_asr_eval_results(
-        samples,
-        outputs,
-        wall_clock_s,
-        lang,
-        model_path=model_path,
-        concurrency=concurrency,
-    )
     benchmark_result["wall_clock_s"] = wall_clock_s
     benchmark_result["worker"] = _worker_delta(before, after)
     return benchmark_result
@@ -285,6 +291,7 @@ async def _run_repeat(args, samples, concurrency: int, repeat: int) -> dict:
             lang=args.lang,
             concurrency=concurrency,
             stream=args.stream,
+            task=getattr(args, "task", "transcribe"),
         )
     finally:
         resources = (
@@ -324,6 +331,9 @@ async def _run_repeat(args, samples, concurrency: int, repeat: int) -> dict:
         "worker": benchmark_result["worker"],
         "resources": resources,
     }
+    result["task"] = getattr(args, "task", "transcribe")
+    if "diarization_metrics" in benchmark_result:
+        result["diarization_metrics"] = benchmark_result["diarization_metrics"]
     if util_summary is not None:
         result["utilization"] = util_summary
     if args.save_raw_dir:
@@ -341,6 +351,10 @@ async def _run_repeat(args, samples, concurrency: int, repeat: int) -> dict:
         "inter_chunk_mean_s",
         "inter_chunk_p95_s",
         "inter_chunk_p99_s",
+        "diarization_first_update_mean_s",
+        "diarization_first_update_p95_s",
+        "diarization_ack_latency_mean_s",
+        "diarization_ack_latency_p95_s",
     ):
         if key in speed:
             result[key] = speed[key]
@@ -433,6 +447,10 @@ def _aggregate(repeats: list[dict]) -> dict:
         "inter_chunk_mean_s",
         "inter_chunk_p95_s",
         "inter_chunk_p99_s",
+        "diarization_first_update_mean_s",
+        "diarization_first_update_p95_s",
+        "diarization_ack_latency_mean_s",
+        "diarization_ack_latency_p95_s",
     ):
         if any(key in repeat for repeat in repeats):
             aggregate[key] = _stat(key)
@@ -490,6 +508,9 @@ def add_common_args(
     parser: argparse.ArgumentParser, *, default_output: str
 ) -> argparse.ArgumentParser:
     """Add the router, sweep, provenance, monitoring, and output options."""
+    parser.add_argument(
+        "--task", choices=["transcribe", "diarize"], default="transcribe"
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument(
         "--port",
@@ -609,7 +630,7 @@ def add_common_args(
         "--stream",
         action="store_true",
         help=(
-            "Use SSE streaming transcription (stream=true). Fills text_ttft_* "
+            "Use SSE for transcription or PCM16 WebSocket replay for diarization. Fills text_ttft_* "
             "and inter_chunk_* speed metrics while preserving final-text WER."
         ),
     )
@@ -730,7 +751,7 @@ async def _sweep(args, samples, concurrencies: list[int]) -> list[dict]:
     for concurrency in concurrencies:
         if args.warmup:
             print(f"[conc={concurrency}] warmup pass ...")
-            await run_asr_transcription(
+            await run_asr_seedtts_once(
                 samples,
                 host=args.host,
                 port=args.port,
@@ -738,6 +759,7 @@ async def _sweep(args, samples, concurrencies: list[int]) -> list[dict]:
                 lang=args.lang,
                 concurrency=concurrency,
                 stream=args.stream,
+                task=getattr(args, "task", "transcribe"),
             )
         repeats: list[dict] = []
         for repeat in range(1, args.repeats + 1):
@@ -832,6 +854,7 @@ def main() -> None:
             "meta": args.meta,
             "lang": args.lang,
             "model_path": args.model_path,
+            "task": args.task,
             "declared_model_revision": model_revision,
             "dataset_revision": dataset_revision,
             "num_samples": len(samples),

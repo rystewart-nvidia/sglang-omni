@@ -14,9 +14,9 @@ NeMo is not required to serve the model.
 
 ## Server Configuration
 
-The model runs on one GPU with FP32 weights. By default, it processes one
-uploaded recording at a time, but you can increase concurrency with `max_concurrency`
-(see [Concurrent Requests](#concurrent-requests)).
+The model runs on one GPU with FP32 weights. `StepScheduler` advances uploaded recordings one model window at a time and schedules live operations between those steps. A newly admitted recording or live operation runs its first window before earlier recordings continue, and earlier recordings then finish before later ones advance. By default, one worker executes device work while up to 16 recordings retain active state. See [Concurrent Requests](#concurrent-requests) for the separate limits.
+
+First use can compile attention kernels, so measure cold requests separately from warmed requests. Compiled attention uses PyTorch's deterministic reduction policy without changing other models' compiler settings. Rotary arithmetic preserves separate FP32 products and addition. Short-window attention pins its query tile so results do not depend on the first compiled length, and long windows use PyTorch's default kernel configuration. Reproducibility checks require the same hardware, software, precision and inference profile. Results are not guaranteed bitwise identical across different runtime versions or devices.
 
 ```bash
 sgl-omni serve --config examples/configs/nemotron_diarization.yaml --port 8000
@@ -31,7 +31,7 @@ model_path: /path/to/Nemotron-3-Diarization-preview.nemo
 ```
 
 You can also point `model_path` to a directory containing that file. Use
-`--config` for this model; automatic discovery with `--model-path` alone does
+`--config` for this model. Automatic discovery with `--model-path` alone does
 not support the `.nemo` archive.
 
 ## Diarize Audio
@@ -85,8 +85,8 @@ sgl-omni serve --config examples/configs/nemotron_diarization.yaml \
 ```
 
 Both profiles accept a complete recording and return one response after
-processing finishes. The `low_latency` setting changes the model's chunking;
-use the WebSocket endpoint below for live audio input.
+processing finishes. The `low_latency` setting changes the model's chunking.
+Use the WebSocket endpoint below for live audio input.
 
 ## Concurrent Requests
 
@@ -97,10 +97,11 @@ sgl-omni serve --config examples/configs/nemotron_diarization.yaml \
     --diarization.factory.max_concurrency 2 --port 8000
 ```
 
-Active requests share model weights and use separate speaker caches and CUDA
-streams. Additional requests wait in the queue. Increasing concurrency uses more
-GPU memory; check memory use and throughput with your recording lengths before
-raising the limit. Both inference profiles support this setting.
+Active requests share model weights and retain separate speaker caches. `max_concurrency` controls simultaneous worker steps, with a separate CUDA stream per worker when it is greater than one. This setting does not enable tensor batching.
+
+`--diarization.factory.max_running_requests` limits recordings retaining active model state, with a default of 16. `--diarization.factory.max_queued_requests` allows 64 additional waiting operations by default. Excess uploads receive HTTP 503. The worker count must not exceed the active request limit. Larger active limits consume more GPU memory because uploads retain features for the complete recording. Benchmark your recording lengths before increasing these limits.
+
+A cancelled recording releases its state after the current model window finishes. The scheduler then advances other ready recordings. Speaker state belongs to each recording and does not use the autoregressive RadixCache.
 
 ## Live Audio
 
@@ -147,16 +148,16 @@ samples, without a WAV header.
 | --- | --- | --- |
 | `session.ready` | server → client | Session ID and accepted audio format |
 | `diarization.update` | server → client | New finalized time range (`start`, `end`) and its `segments` |
-| `audio.ack` | server → client | Audio accepted; `processed_until` is the finalized timestamp |
+| `audio.ack` | server → client | Audio accepted, with `processed_until` as the finalized timestamp |
 | `audio.end` | client → server | Flush remaining audio and finish the recording |
-| `diarization.done` | server → client | Final recording duration; the server then closes the socket |
-| `session.reset` | client → server | Discard buffered audio and speaker state; start a new recording |
-| `error` | server → client | Error message; the server then closes the socket |
+| `diarization.done` | server → client | Final recording duration, after which the server closes the socket |
+| `session.reset` | client → server | Discard buffered audio and speaker state, then start a new recording |
+| `error` | server → client | Error message, after which the server closes the socket |
 
 Send control events as JSON, for example `{"type": "audio.end"}`. Updates contain
 absolute timestamps from the start of the session and preserve overlapping
-speakers. A speaker interval can continue in the next update; concatenate adjacent
-intervals with the same speaker if you need a full-recording timeline. Earlier
+speakers. A speaker interval can continue in the next update, so concatenate
+adjacent intervals with the same speaker if you need a full-recording timeline. Earlier
 updates are not revised. Silence produces updates with empty segment lists.
 A reset returns a new `session.ready` and restarts timestamps and speaker labels.
 Disconnecting releases the session, including any buffered audio.
@@ -164,10 +165,10 @@ Disconnecting releases the session, including any buffered audio.
 The server keeps up to eight live sessions by default. Increase
 `--diarization.factory.max_live_sessions` to change that limit. Each session keeps
 its own bounded audio buffer and speaker cache while sharing model weights.
-Live sessions use the single-stage pipeline in the example configuration; process
+Live sessions use the single-stage pipeline in the example configuration. Process
 replicas are not supported for this endpoint.
 `max_concurrency` controls simultaneous inference work across uploads and live
-chunks; it is separate from the number of open sessions. A connection idle for
+chunks. It is separate from the number of open sessions. A connection idle for
 60 seconds is closed. The server rejects excess queued audio instead of dropping
 samples, so timestamps remain aligned with the audio you sent.
 
@@ -178,6 +179,34 @@ samples, so timestamps remain aligned with the audio you sent.
 - Simultaneous inference work is limited by `max_concurrency`, which defaults to `1`.
 - Disconnecting a client discards pending results and releases its live session.
   An inference call already in progress finishes before its worker starts more work.
+
+## Benchmarks
+
+Start the server with the local checkpoint configuration above, then select `--task diarize` in the audio benchmark entry points. The default task remains transcription for existing ASR models.
+
+```bash
+python -m benchmarks.eval.benchmark_asr_transcribe_diarize \
+    --task diarize --dataset movies800times --use-existing-server \
+    --model-path /path/to/Nemotron-3-Diarization-preview.nemo \
+    --max-concurrency 16 --output-dir results/nemotron_movies
+```
+
+Movies800Time, AISHELL4 and GoogleTime require authorized access to their private datasets. Use `--dataset aishell4_long` or `--dataset googletime` for the other labeled corpora. Pin the dataset with `--dataset-revision`. Diarization mode reports overlap-aware DER, speaker-count accuracy, and speaker-count MAE from reference speaker timestamps. DER excludes zero seconds on each side of reference boundaries by default. Set `--der-collar` to change that radius. Empty predictions and failed requests count as misses. These corpora and scoring settings differ from the model card and do not reproduce its published values.
+
+```bash
+python -m benchmarks.eval.benchmark_asr_stt_benchmark \
+    --task diarize --port 8000 \
+    --model-path /path/to/Nemotron-3-Diarization-preview.nemo \
+    --concurrencies 1,4,16 --repeats 3 --warmup
+python -m benchmarks.eval.benchmark_asr_seedtts \
+    --task diarize --port 8000 \
+    --model-path /path/to/Nemotron-3-Diarization-preview.nemo \
+    --lang en --concurrencies 1,4,16 --repeats 3 --warmup
+```
+
+STT and SeedTTS have no reference speaker intervals in these loaders, so their diarization mode measures latency and audio throughput only. WER and CER are unavailable for this model. Use `--save-raw-dir` to retain individual SeedTTS or STT requests.
+
+Add `--stream` to replay 100 ms PCM16 packets through the live WebSocket endpoint. The client waits for each acknowledgement and sends without real-time pacing. This measures replay throughput and response latency. It does not measure microphone-to-speaker latency. For 16 simultaneous streams, configure `--diarization.factory.max_live_sessions 16` on the server.
 
 ## Tests
 

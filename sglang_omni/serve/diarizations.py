@@ -11,6 +11,7 @@ import msgspec
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
 from fastapi.responses import JSONResponse
 
+from sglang_omni.admission import QueueFullError
 from sglang_omni.client import Client, GenerateRequest
 from sglang_omni.client.types import CompletionResult
 from sglang_omni.serve.openai_errors import is_bad_request_error
@@ -116,6 +117,8 @@ def register_diarizations(app: FastAPI) -> None:
         except HTTPException:
             raise
         except Exception as exc:
+            if QueueFullError.matches(exc):
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
             if is_bad_request_error(exc):
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             logger.exception("Diarization failed for %s", request_id)

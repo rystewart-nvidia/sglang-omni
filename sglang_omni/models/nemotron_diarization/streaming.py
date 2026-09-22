@@ -9,7 +9,8 @@ import time
 import numpy as np
 import torch
 
-from sglang_omni.client.types import DiarizationResult, DiarizationSegment
+from sglang_omni.client.types import DiarizationResult
+from sglang_omni.models.nemotron_diarization.backend import probabilities_to_segments
 from sglang_omni.models.nemotron_diarization.speaker_cache import SpeakerCache
 
 SAMPLE_RATE = 16000
@@ -92,30 +93,15 @@ class LiveDiarization:
     def append(self, pcm: bytes, *, final: bool = False) -> DiarizationResult:
         start_frame = self.frame
         audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768
-        predictions = self.probabilities(audio, final=final)[0].cpu().numpy()
-        segments = []
-        for speaker in range(8):
-            values = predictions[:, speaker]
-            positions = np.arange(1, len(values) + 1)
-            last_event = np.maximum.accumulate(np.where(values != 0.5, positions, 0))
-            active = np.concatenate(([self.active[speaker]], values > 0.5))[last_event]
-            if len(active):
-                self.active[speaker] = active[-1]
-            changes = np.diff(np.pad(active.astype(np.int8), (1, 1)))
-            for start, end in zip(
-                np.flatnonzero(changes == 1), np.flatnonzero(changes == -1)
-            ):
-                segments.append(
-                    DiarizationSegment(
-                        start=float(start_frame + start) / 100,
-                        end=float(start_frame + end) / 100,
-                        speaker=f"speaker_{speaker}",
-                    )
-                )
-        segments.sort(key=lambda item: (item.start, item.end, item.speaker))
-        return DiarizationResult(
-            duration=self.samples / SAMPLE_RATE if final else self.frame / 100,
-            segments=segments,
+        predictions = self.probabilities(audio, final=final)[0]
+        duration = self.samples / SAMPLE_RATE if final else self.frame / 100
+        if not predictions.shape[0]:
+            return DiarizationResult(duration=duration, segments=[])
+        return probabilities_to_segments(
+            predictions.cpu().numpy(),
+            duration=duration,
+            start_frame=start_frame,
+            active=self.active,
         )
 
 
@@ -127,6 +113,35 @@ class LiveSessions:
         self.max_sessions = max_sessions
         self.sessions: dict[str, LiveDiarization] = {}
         self.lock = threading.Lock()
+        self.pending: dict[str, int] = {}
+
+    def reserve(self, session_id: str) -> None:
+        """Pin accepted activity through scheduler queueing and execution."""
+        with self.lock:
+            state = self.sessions.get(session_id)
+            if (
+                state is not None
+                and not state.lock.locked()
+                and session_id not in self.pending
+                and time.monotonic() - state.last_used > SESSION_IDLE_SECONDS
+            ):
+                del self.sessions[session_id]
+            self.pending[session_id] = self.pending.get(session_id, 0) + 1
+
+    def release(self, session_id: str, *, aborted: bool) -> None:
+        with self.lock:
+            remaining = self.pending.get(session_id, 1) - 1
+            if remaining:
+                self.pending[session_id] = remaining
+            else:
+                self.pending.pop(session_id, None)
+            if aborted:
+                self.sessions.pop(session_id, None)
+
+    def close(self) -> None:
+        with self.lock:
+            self.sessions.clear()
+            self.pending.clear()
 
     def compute(self, inputs) -> DiarizationResult:
         session_id = inputs["session_id"]
@@ -142,7 +157,8 @@ class LiveSessions:
             now = time.monotonic()
             for key, state in list(self.sessions.items()):
                 if (
-                    not state.lock.locked()
+                    key not in self.pending
+                    and not state.lock.locked()
                     and now - state.last_used > SESSION_IDLE_SECONDS
                 ):
                     del self.sessions[key]

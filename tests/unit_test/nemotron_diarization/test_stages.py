@@ -3,19 +3,22 @@
 
 import io
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
 import soundfile as sf
 import torch
 
-from sglang_omni.client import Client, DiarizationResult, GenerateRequest
+from sglang_omni.client import Client, GenerateRequest
 from sglang_omni.models.nemotron_diarization import stages
 from sglang_omni.models.nemotron_diarization.backend import NemotronDiarizer
+from sglang_omni.models.nemotron_diarization.model import NemotronDiarizationModel
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.messages import IncomingMessage
 
 
 @pytest.fixture
@@ -35,19 +38,51 @@ def executor(cuda_platform, monkeypatch):
         def __init__(self, model_path, *, device, profile):
             # A hard-coded cuda:0 would put every stage on the wrong GPU.
             assert device == torch.device("cuda:3")
+            self.device = torch.device("cpu")
+            self.model = SimpleNamespace(
+                profile=(8, 8, 340, 40, 3),
+                preprocessor=self.preprocess,
+                forward_chunk=lambda features, state, right: torch.zeros(
+                    1, features.shape[2] - right, 8
+                ),
+            )
 
-        def diarize(self, waveform):
-            calls.append(waveform)
-            return DiarizationResult(duration=len(waveform) / 16000, segments=[])
+            self.model.iter_chunks = MethodType(
+                NemotronDiarizationModel.iter_chunks, self.model
+            )
+
+        def preprocess(self, signal):
+            calls.append(signal[0].numpy())
+            length = signal.shape[1] // 160
+            return torch.zeros(1, 128, length), length
 
     monkeypatch.setattr(stages, "NemotronDiarizer", RecordingDiarizer)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda device: SimpleNamespace(synchronize=lambda: None),
+    )
     scheduler = stages.create_diarization_executor("unused", device="cuda", gpu_id=3)
-    assert scheduler._max_concurrency == 1  # Serialize inference to bound GPU memory.
     return scheduler, calls
 
 
+def run_payload(scheduler, request):
+    thread = threading.Thread(target=scheduler.start)
+    thread.start()
+    try:
+        scheduler.inbox.put(IncomingMessage(request.request_id, "new_request", request))
+        result = scheduler.outbox.get(timeout=5)
+        if result.type == "error":
+            raise result.data
+        return result.data
+    finally:
+        scheduler.stop()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+
 def payload(audio, *, task="diarization"):
-    request = Client._build_omni_request(
+    request = Client.build_omni_request(
         GenerateRequest(
             prompt={"audio_bytes": audio}, stream=False, metadata={"task": task}
         )
@@ -61,14 +96,15 @@ def wav(samples, rate):
     return stream.getvalue()
 
 
-def test_stereo_resampling_preserves_duration_and_request_identity(executor):
+@pytest.mark.parametrize("samples", [1, 8000])
+def test_stereo_resampling_preserves_duration_and_request_identity(executor, samples):
     scheduler, calls = executor
-    audio = wav(np.column_stack([np.ones(8000), -np.ones(8000)]), 8000)
-    result = scheduler._fn(payload(audio))
-    assert calls[0].shape == (16000,)
-    np.testing.assert_array_equal(calls[0], np.zeros(16000))
+    audio = wav(np.column_stack([np.ones(samples), -np.ones(samples)]), 8000)
+    result = run_payload(scheduler, payload(audio))
+    assert calls[0].shape == (samples * 2,)
+    np.testing.assert_array_equal(calls[0], np.zeros(samples * 2))
     assert result.request_id == "recording"
-    assert result.data == {"diarization": {"duration": 1.0, "segments": []}}
+    assert result.data == {"diarization": {"duration": samples / 8000, "segments": []}}
 
 
 @pytest.mark.parametrize(
@@ -78,14 +114,14 @@ def test_stereo_resampling_preserves_duration_and_request_identity(executor):
 def test_invalid_audio_never_reaches_inference(executor, audio):
     scheduler, calls = executor
     with pytest.raises(ValueError, match="could not decode the uploaded audio"):
-        scheduler._fn(payload(audio))
+        run_payload(scheduler, payload(audio))
     assert not calls
 
 
 def test_transcription_request_never_runs_diarization(executor):
     scheduler, calls = executor
     with pytest.raises(ValueError, match="/v1/audio/diarizations"):
-        scheduler._fn(payload(b"unused", task="asr"))
+        run_payload(scheduler, payload(b"unused", task="asr"))
     assert not calls
 
 
@@ -103,7 +139,7 @@ def test_low_level_client_cannot_silently_apply_generation_controls(executor, pa
     request = payload(wav(np.zeros(16000), 16000))
     request.request.params.update(params)
     with pytest.raises(ValueError, match="Unsupported diarization controls"):
-        scheduler._fn(request)
+        run_payload(scheduler, request)
     assert not calls
 
 
@@ -154,9 +190,14 @@ def test_failed_inference_waits_for_gpu_before_propagating_error(
 
     class FailingDiarizer:
         def __init__(self, *args, **kwargs):
-            pass
+            self.device = torch.device("cpu")
+            self.model = SimpleNamespace(preprocessor=self.preprocess)
 
-        def diarize(self, waveform):
+            self.model.iter_chunks = MethodType(
+                NemotronDiarizationModel.iter_chunks, self.model
+            )
+
+        def preprocess(self, signal):
             launched.set()
             raise RuntimeError("inference failed after launching GPU work")
 
@@ -169,7 +210,9 @@ def test_failed_inference_waits_for_gpu_before_propagating_error(
         "unused", device="cuda", gpu_id=3, max_concurrency=2
     )
     with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(scheduler._fn, payload(wav(np.zeros(1600), 16000)))
+        future = pool.submit(
+            run_payload, scheduler, payload(wav(np.zeros(1600), 16000))
+        )
         try:
             assert waiting.wait(timeout=5)
             assert not future.done()
@@ -177,3 +220,54 @@ def test_failed_inference_waits_for_gpu_before_propagating_error(
             finished.set()
         with pytest.raises(RuntimeError, match="inference failed"):
             future.result(timeout=5)
+
+
+def test_rejected_live_close_releases_session_even_when_queue_is_full():
+    from sglang_omni.admission import QueueFullError
+    from sglang_omni.scheduling.step_scheduler import StepResult, StepScheduler
+
+    entered, release = threading.Event(), threading.Event()
+
+    class BlockedTask:
+        def step(self):
+            entered.set()
+            assert release.wait(5)
+            return StepResult(done=True)
+
+        def close(self, *, aborted):
+            pass
+
+    worker = stages.DiarizationWorker(SimpleNamespace(model=None, device="cpu"), 1, 1)
+    worker.live_sessions.sessions["connected"] = SimpleNamespace(
+        lock=threading.Lock(), last_used=time.monotonic()
+    )
+    request = Client.build_omni_request(
+        GenerateRequest(
+            prompt={"session_id": "connected", "operation": "close"},
+            stream=False,
+            metadata={"task": "diarization_stream"},
+        )
+    )
+    close = StagePayload(request_id="close", request=request, data={})
+    scheduler = StepScheduler(
+        lambda value: worker.build(value) if value is close else BlockedTask(),
+        max_running_requests=1,
+        max_queued_requests=1,
+    )
+    thread = threading.Thread(target=scheduler.start)
+    thread.start()
+    try:
+        scheduler.inbox.put(IncomingMessage("active", "new_request", None))
+        assert entered.wait(5)
+        scheduler.inbox.put(IncomingMessage("waiting", "new_request", None))
+        scheduler.inbox.put(IncomingMessage("close", "new_request", close))
+        rejection = scheduler.outbox.get(timeout=5)
+        assert rejection.request_id == "close"
+        assert isinstance(rejection.data, QueueFullError)
+        assert not worker.live_sessions.sessions
+        assert not worker.live_sessions.pending
+    finally:
+        scheduler.stop()
+        release.set()
+        thread.join(5)
+        assert not thread.is_alive()

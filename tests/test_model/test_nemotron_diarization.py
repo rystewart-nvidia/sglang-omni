@@ -47,8 +47,25 @@ def checkpoint():
     return path
 
 
+@pytest.fixture(scope="module")
+def deterministic_reference():
+    from nemo.collections.asr.modules import transformer_encoder_utils
+    from torch.nn.attention.flex_attention import flex_attention
+
+    # The exact oracle specifies its own compiler policy independently.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            transformer_encoder_utils,
+            "_flex_attention_compiled",
+            torch.compile(
+                flex_attention, dynamic=True, options={"deterministic": True}
+            ),
+        )
+        yield
+
+
 @pytest.fixture(scope="module", params=["offline", "low_latency"])
-def reference_models(checkpoint, request):
+def reference_models(checkpoint, request, deterministic_reference):
     from nemo.collections.asr.models import SortformerEncLabelModel
 
     from sglang_omni.models.nemotron_diarization.backend import (
@@ -258,13 +275,15 @@ def test_concurrent_stage_reuses_bounded_workers_and_cuda_streams(
         for name in ("speech", "silence")
     }
 
+    original_preprocess = native.model.preprocessor.forward
+
     def simultaneous(waveform):
         stream = torch.cuda.current_stream(native.device).cuda_stream
         worker_streams.setdefault(threading.get_ident(), set()).add(stream)
         barrier.wait()
-        return original(waveform)
+        return original_preprocess(waveform)
 
-    monkeypatch.setattr(native, "diarize", simultaneous)
+    monkeypatch.setattr(native.model.preprocessor, "forward", simultaneous)
     monkeypatch.setattr(stages, "NemotronDiarizer", lambda *args, **kwargs: native)
     scheduler = stages.create_diarization_executor(
         "unused", device="cuda", gpu_id=0, max_concurrency=2
@@ -279,7 +298,7 @@ def test_concurrent_stage_reuses_bounded_workers_and_cuda_streams(
             for index, name in enumerate(names):
                 request_id = f"{batch}-{index}"
                 pending[request_id] = expected[name]
-                request = Client._build_omni_request(
+                request = Client.build_omni_request(
                     GenerateRequest(
                         prompt={"audio_bytes": recordings[name]},
                         stream=False,
@@ -323,14 +342,15 @@ def test_bad_upload_returns_400_and_worker_recovers(deployment, audio):
     )
 
 
-def test_native_restore_rejects_incomplete_weights(checkpoint, tmp_path):
+@pytest.mark.parametrize("variant", ["incomplete", "dtype_and_layout"])
+def test_native_restore_preserves_weight_contract(checkpoint, tmp_path, variant):
     from sglang_omni.models.nemotron_diarization.backend import (
         NemotronDiarizer,
+        load_checkpoint_weights,
         resolve_nemo_checkpoint,
     )
 
-    # Keep the real architecture config but omit its weights. This guards a
-    # future strict=False change that would silently serve random layers.
+    # Keep the real architecture and check rejection and copy-load semantics.
     with tarfile.open(resolve_nemo_checkpoint(checkpoint)) as archive:
         config_member = next(
             m
@@ -339,8 +359,13 @@ def test_native_restore_rejects_incomplete_weights(checkpoint, tmp_path):
         )
         config = archive.extractfile(config_member).read()
     weights = io.BytesIO()
-    torch.save({"unexpected.weight": torch.zeros(1)}, weights)
-    broken = tmp_path / "incomplete.nemo"
+    state = {"unexpected.weight": torch.zeros(1)}
+    key = "encoder.layers.0.attn.out_proj.weight"
+    if variant == "dtype_and_layout":
+        state = load_checkpoint_weights(resolve_nemo_checkpoint(checkpoint))
+        state[key] = state[key].double().t().contiguous().t()
+    torch.save(state, weights)
+    broken = tmp_path / f"{variant}.nemo"
     with tarfile.open(broken, "w") as archive:
         for name, data in [
             ("model_config.yaml", config),
@@ -349,8 +374,14 @@ def test_native_restore_rejects_incomplete_weights(checkpoint, tmp_path):
             info = tarfile.TarInfo(name)
             info.size = len(data)
             archive.addfile(info, io.BytesIO(data))
-    with pytest.raises(RuntimeError, match="Missing key.*state_dict"):
-        NemotronDiarizer(str(broken), device="cuda:0")
+    if variant == "incomplete":
+        with pytest.raises(RuntimeError, match="Missing key.*state_dict"):
+            NemotronDiarizer(str(broken), device="cuda:0")
+    else:
+        model = NemotronDiarizer(str(broken), device="cuda:0").model
+        restored = model.state_dict()[key]
+        assert restored.dtype == torch.float32 and restored.is_contiguous()
+        torch.testing.assert_close(restored.cpu(), state[key].float(), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("reference_models", ["low_latency"], indirect=True)
@@ -383,9 +414,20 @@ def test_live_probabilities_match_nemo_across_message_boundaries(
         if len(waveform) > 17000:
             assert sum(chunk.shape[1] for chunk in chunks) > 0
         chunks.append(stream.probabilities(np.empty(0, np.float32), final=True).cpu())
-        torch.testing.assert_close(
-            torch.cat(chunks, dim=1), reference[0].cpu(), rtol=0, atol=0
+        actual = torch.cat(chunks, dim=1)
+        expected = reference[0].cpu()
+        # Full and incremental mel products have different reduction shapes.
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=2e-6)
+        assert torch.equal(actual > 0.5, expected > 0.5)
+        repacketized = LiveDiarization(native.model, device=native.device)
+        other = [
+            repacketized.probabilities(waveform[offset : offset + 16000]).cpu()
+            for offset in range(0, len(waveform), 16000)
+        ]
+        other.append(
+            repacketized.probabilities(np.empty(0, np.float32), final=True).cpu()
         )
+        torch.testing.assert_close(actual, torch.cat(other, dim=1), rtol=0, atol=0)
 
 
 def _merge_live_segments(updates):

@@ -147,3 +147,30 @@ def test_inference_failure_discards_partial_state_and_releases_capacity(monkeypa
     assert not state.lock.locked()
     manager.compute(dict(session_id="replacement", operation="open"))
     assert manager.sessions["replacement"].state.fifo.shape[1] == 0
+
+
+def test_queued_activity_prevents_expiry_and_abort_releases_reservation(monkeypatch):
+    from sglang_omni.models.nemotron_diarization import streaming
+
+    now = [0.0]
+    monkeypatch.setattr(streaming.time, "monotonic", lambda: now[0])
+    manager = LiveSessions(SimpleNamespace(model=AcousticProbe(), device="cpu"), 1)
+    manager.compute(dict(session_id="live", operation="open"))
+    now[0] = 55.0
+    manager.reserve("live")
+    now[0] = 65.0
+    result = manager.compute(dict(session_id="live", operation="append", pcm=b"\0\0"))
+    manager.release("live", aborted=False)
+    assert result.duration == 0.0
+    assert "live" in manager.sessions
+    assert not manager.pending
+    manager.reserve("live")
+    manager.release("live", aborted=True)
+    assert not manager.sessions
+    assert not manager.pending
+    manager.compute(dict(session_id="expired", operation="open"))
+    now[0] += 61.0
+    manager.reserve("expired")
+    with pytest.raises(ValueError, match="closed or expired"):
+        manager.compute(dict(session_id="expired", operation="append", pcm=b"\0\0"))
+    manager.release("expired", aborted=True)

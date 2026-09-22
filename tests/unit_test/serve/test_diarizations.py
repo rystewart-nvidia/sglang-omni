@@ -104,12 +104,18 @@ def test_invalid_upload_or_model_is_rejected_before_dispatch(audio, data, status
     assert not coordinator.requests
 
 
-def test_audio_decode_error_crosses_client_boundary_as_bad_request():
+@pytest.mark.parametrize(
+    "message, status",
+    [("could not decode the uploaded audio", 400), ("The request queue is full.", 503)],
+)
+def test_diarization_error_crosses_client_boundary_with_expected_status(
+    message, status
+):
     from sglang_omni.client import ClientError
 
     class FailingCoordinator:
         async def submit(self, request_id, request):
-            raise ClientError("could not decode the uploaded audio")
+            raise ClientError(message)
 
     app = create_app(
         Client(FailingCoordinator()), architectures=["SortformerEncLabelModel"]
@@ -117,7 +123,7 @@ def test_audio_decode_error_crosses_client_boundary_as_bad_request():
     response = TestClient(app).post(
         "/v1/audio/diarizations", files={"file": ("bad.wav", b"bad")}
     )
-    assert response.status_code == 400
+    assert response.status_code == status
 
 
 def test_existing_text_chunk_serialization_does_not_gain_a_null_field():

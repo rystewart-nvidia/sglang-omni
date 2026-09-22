@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import io
-import math
-import re
 import tarfile
 from pathlib import Path
 
@@ -156,31 +154,6 @@ def validate_checkpoint(path: Path) -> None:
             raise ValueError(f"Checkpoint is not the supported {section} configuration")
 
 
-def parse_segments(lines: list[str], duration: float) -> DiarizationResult:
-    """Preserve overlapping speakers and clip frame-rounded ends to the waveform."""
-    segments = []
-    for line in lines:
-        try:
-            start_text, end_text, speaker = line.split()
-            start, end = float(start_text), float(end_text)
-        except (ValueError, AttributeError) as exc:
-            raise RuntimeError(f"Invalid diarization segment: {line!r}") from exc
-        if (
-            not math.isfinite(start)
-            or not math.isfinite(end)
-            or start < 0
-            or end <= start
-            or re.fullmatch(r"speaker_[0-7]", speaker) is None
-            or end > duration + 0.01
-        ):
-            raise RuntimeError(f"Invalid diarization segment: {line!r}")
-        end = min(end, duration)
-        if start < end:
-            segments.append(DiarizationSegment(start=start, end=end, speaker=speaker))
-    segments.sort(key=lambda segment: (segment.start, segment.end, segment.speaker))
-    return DiarizationResult(duration=duration, segments=segments)
-
-
 class NemotronDiarizer:
     def __init__(
         self, model_path: str, *, device: torch.device, profile: str = "offline"
@@ -198,8 +171,14 @@ class NemotronDiarizer:
         checkpoint = resolve_nemo_checkpoint(model_path)
         validate_checkpoint(checkpoint)
         self.device = torch.device(device)
-        self.model = NemotronDiarizationModel(profile=_PROFILES[profile])
-        self.model.load_state_dict(load_checkpoint_weights(checkpoint), strict=True)
+        with torch.device("meta"):
+            self.model = NemotronDiarizationModel(profile=_PROFILES[profile])
+        weights = load_checkpoint_weights(checkpoint)
+        for name, tensor in self.model.state_dict().items():
+            if name in weights:
+                weights[name] = weights[name].to(dtype=tensor.dtype).contiguous()
+        self.model.load_state_dict(weights, strict=True, assign=True)
+        del weights
         self.model.to(device=self.device).eval()
 
     @torch.inference_mode()
@@ -217,7 +196,7 @@ class NemotronDiarizer:
 
 def load_checkpoint_weights(path: Path) -> dict[str, torch.Tensor]:
     """Read tensors without extracting paths or executing pickle globals."""
-    with tarfile.open(path) as archive:
+    with open(path, "rb") as raw, tarfile.open(fileobj=raw) as archive:
         members = [
             m
             for m in archive.getmembers()
@@ -226,9 +205,9 @@ def load_checkpoint_weights(path: Path) -> dict[str, torch.Tensor]:
         if len(members) != 1 or not members[0].isfile() or members[0].size > 1024**3:
             raise ValueError("Expected one model_weights.ckpt in the .nemo archive")
         with archive.extractfile(members[0]) as handle:
-            weights = torch.load(
-                io.BytesIO(handle.read()), map_location="cpu", weights_only=True
-            )
+            # Compressed streams need buffering to avoid repeated decompression.
+            source = handle if archive.fileobj is raw else io.BytesIO(handle.read())
+            weights = torch.load(source, map_location="cpu", weights_only=True)
     if not isinstance(weights, dict) or not all(
         isinstance(k, str) and isinstance(v, torch.Tensor) for k, v in weights.items()
     ):
@@ -237,7 +216,11 @@ def load_checkpoint_weights(path: Path) -> dict[str, torch.Tensor]:
 
 
 def probabilities_to_segments(
-    predictions: np.ndarray, *, duration: float
+    predictions: np.ndarray,
+    *,
+    duration: float,
+    start_frame: int = 0,
+    active: np.ndarray | None = None,
 ) -> DiarizationResult:
     """NeMo's default 0.5 hysteresis at 10 ms, preserving equal-threshold state."""
     if (
@@ -246,17 +229,31 @@ def probabilities_to_segments(
         or not np.isfinite(predictions).all()
     ):
         raise RuntimeError("Invalid diarization probabilities")
-    lines = []
+    if active is None:
+        active = np.zeros(8, dtype=bool)
+    positions = np.arange(1, len(predictions) + 1)
+    segments = []
     for speaker in range(8):
         values = predictions[:, speaker]
-        positions = np.arange(1, len(values) + 1)
         events = np.where(values != 0.5, positions, 0)
         last_event = np.maximum.accumulate(events)
-        active = np.concatenate(([False], values > 0.5))[last_event]
-        changes = np.diff(np.pad(active.astype(np.int8), (1, 1)))
+        activity = np.concatenate(([active[speaker]], values > 0.5))[last_event]
+        if len(activity):
+            active[speaker] = activity[-1]
+        changes = np.diff(np.pad(activity.astype(np.int8), (1, 1)))
         starts, ends = np.flatnonzero(changes == 1), np.flatnonzero(changes == -1)
-        lines.extend(
-            f"{start / 100:.3f} {end / 100:.3f} speaker_{speaker}"
-            for start, end in zip(starts, ends)
-        )
-    return parse_segments(lines, duration)
+        for start, end in zip(starts, ends):
+            start, end = (start_frame + int(start)) / 100, (
+                start_frame + int(end)
+            ) / 100
+            if end > duration + 0.01:
+                raise RuntimeError("Diarization segment extends past the audio")
+            end = min(end, duration)
+            if start < end:
+                segments.append(
+                    DiarizationSegment(
+                        start=start, end=end, speaker=f"speaker_{speaker}"
+                    )
+                )
+    segments.sort(key=lambda segment: (segment.start, segment.end, segment.speaker))
+    return DiarizationResult(duration=duration, segments=segments)

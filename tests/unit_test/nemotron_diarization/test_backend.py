@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Guard checkpoint-family selection and overlapping, frame-rounded intervals."""
 
+import importlib
 import io
 import tarfile
 
@@ -12,7 +13,6 @@ import yaml
 
 from sglang_omni.models.nemotron_diarization.backend import (
     load_checkpoint_weights,
-    parse_segments,
     probabilities_to_segments,
     resolve_nemo_checkpoint,
     validate_checkpoint,
@@ -20,9 +20,10 @@ from sglang_omni.models.nemotron_diarization.backend import (
 
 
 def test_segments_preserve_overlap_and_clip_only_the_partial_last_frame():
-    result = parse_segments(
-        ["1.000 2.510 speaker_7", "0.000 2.000 speaker_0"], duration=2.504
-    )
+    predictions = np.zeros((251, 8))
+    predictions[:200, 0] = 1
+    predictions[100:, 7] = 1
+    result = probabilities_to_segments(predictions, duration=2.504)
     assert msgspec.to_builtins(result) == {
         "duration": 2.504,
         "segments": [
@@ -32,22 +33,9 @@ def test_segments_preserve_overlap_and_clip_only_the_partial_last_frame():
     }
 
 
-@pytest.mark.parametrize(
-    "line",
-    [
-        "nan 1 speaker_0",
-        "0 inf speaker_0",
-        "-1 1 speaker_0",
-        "1 0 speaker_0",
-        "0 1 speaker_8",
-        "0 20 speaker_0",
-        "0 1",
-        "0 0 speaker_0",
-    ],
-)
-def test_invalid_model_segments_are_not_silently_repaired(line):
-    with pytest.raises(RuntimeError, match="Invalid diarization segment"):
-        parse_segments([line], duration=2.0)
+def test_probabilities_cannot_extend_segments_beyond_audio():
+    with pytest.raises(RuntimeError, match="segment extends past the audio"):
+        probabilities_to_segments(np.ones((300, 8)), duration=2.0)
 
 
 @pytest.mark.parametrize(
@@ -193,3 +181,30 @@ def test_checkpoint_rejects_non_tensor_state_entries(tmp_path):
         archive.addfile(info, io.BytesIO(serialized.getvalue()))
     with pytest.raises(ValueError, match="tensor state dictionary"):
         load_checkpoint_weights(path)
+
+
+def test_reused_attention_masks_preserve_each_valid_length():
+    from sglang_omni.models.nemotron_diarization.model import TransformerEncoder
+
+    encoder = TransformerEncoder(max_frames=9)
+    embeddings = torch.zeros(1, 9, 512)
+    positions = torch.arange(9)
+    for valid_length in [9, 3, 8, 3, 9]:
+        mask = encoder.attention_mask(embeddings, valid_length)
+        actual = mask.mask_mod(0, 0, 0, positions)
+        torch.testing.assert_close(actual, positions < valid_length)
+
+
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_model_compiler_policy_leaves_other_models_unchanged(deterministic):
+    from sglang_omni.models.nemotron_diarization import model
+
+    with torch._inductor.config.patch(
+        {"deterministic": deterministic, "triton.autotune_pointwise": True}
+    ):
+        importlib.reload(model)
+        assert torch._inductor.config.deterministic is deterministic
+        assert torch._inductor.config.triton.autotune_pointwise is True
+        config = model._compiled_attention.get_compiler_config()
+        assert config["deterministic"] is True
+        assert config["triton.autotune_pointwise"] is False

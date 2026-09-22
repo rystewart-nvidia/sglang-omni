@@ -46,8 +46,8 @@ class Client:
         stream_builder: Callable[[str, StreamMessage], GenerateChunk] | None = None,
     ) -> None:
         self._coordinator = coordinator
-        self._result_builder = result_builder or self._default_result_builder
-        self._stream_builder = stream_builder or self._default_stream_builder
+        self._result_builder = result_builder or self.default_result_builder
+        self._stream_builder = stream_builder or self.default_stream_builder
 
     # ------------------------------------------------------------------
     # Low-level generate (backward compatible)
@@ -59,7 +59,7 @@ class Client:
         request_id: str | None = None,
     ) -> AsyncIterator[GenerateChunk]:
         req_id = request_id or str(uuid.uuid4())
-        omni_request = self._build_omni_request(request)
+        omni_request = self.build_omni_request(request)
         if request.stream:
             coordinator_stream = self._coordinator.stream(req_id, omni_request)
             async with aclosing(coordinator_stream):
@@ -421,7 +421,7 @@ class Client:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _set_audio_data(chunk: GenerateChunk, data: dict[str, Any]) -> None:
+    def set_audio_data(chunk: GenerateChunk, data: dict[str, Any]) -> None:
         audio_data = data.get("audio_data") or data.get("audio")
         if audio_data is None and data.get("audio_waveform") is not None:
             raw = data.get("audio_waveform")
@@ -441,7 +441,7 @@ class Client:
             chunk.sample_rate = sample_rate
 
     @staticmethod
-    def _build_usage_info(data: dict[str, Any]) -> UsageInfo | None:
+    def build_usage_info(data: dict[str, Any]) -> UsageInfo | None:
         usage = dict(data.get("usage") or {})
         if "prompt_tokens" not in usage and data.get("prompt_tokens") is not None:
             usage["prompt_tokens"] = data.get("prompt_tokens")
@@ -460,9 +460,9 @@ class Client:
         return UsageInfo.from_dict(usage)
 
     @staticmethod
-    def _build_omni_request(request: GenerateRequest) -> OmniRequest:
-        inputs = _extract_inputs(request)
-        params = _build_params(request)
+    def build_omni_request(request: GenerateRequest) -> OmniRequest:
+        inputs = extract_inputs(request)
+        params = build_params(request)
         metadata = dict(request.metadata)
         if request.model:
             metadata.setdefault("model", request.model)
@@ -471,7 +471,7 @@ class Client:
         return OmniRequest(inputs=inputs, params=params, metadata=metadata)
 
     @staticmethod
-    def _default_result_builder(request_id: str, result: Any) -> GenerateChunk:
+    def default_result_builder(request_id: str, result: Any) -> GenerateChunk:
         chunk = GenerateChunk(request_id=request_id, finish_reason="stop")
         if isinstance(result, GenerateChunk):
             result.request_id = request_id
@@ -502,10 +502,10 @@ class Client:
                 weight_version = decode_result.get("weight_version")
                 if weight_version is not None:
                     chunk.weight_version = weight_version
-                Client._set_audio_data(chunk, audio_result)
-                chunk.usage = Client._build_usage_info(
+                Client.set_audio_data(chunk, audio_result)
+                chunk.usage = Client.build_usage_info(
                     decode_result
-                ) or Client._build_usage_info(audio_result)
+                ) or Client.build_usage_info(audio_result)
                 return chunk
             text = result.get("text")
             if isinstance(text, str):
@@ -538,8 +538,8 @@ class Client:
             language = result.get("language")
             if isinstance(language, str):
                 chunk.language = language
-            Client._set_audio_data(chunk, result)
-            chunk.usage = Client._build_usage_info(result)
+            Client.set_audio_data(chunk, result)
+            chunk.usage = Client.build_usage_info(result)
             if result.get("diarization") is not None:
                 chunk.diarization = msgspec.convert(
                     result["diarization"], type=DiarizationResult
@@ -552,7 +552,7 @@ class Client:
         return chunk
 
     @staticmethod
-    def _default_stream_builder(request_id: str, msg: StreamMessage) -> GenerateChunk:
+    def default_stream_builder(request_id: str, msg: StreamMessage) -> GenerateChunk:
         chunk = GenerateChunk(request_id=request_id)
         chunk.stage_name = msg.stage_name or msg.from_stage
         chunk.stage_id = msg.stage_id
@@ -593,7 +593,7 @@ class Client:
             finish_reason = data.get("finish_reason")
             if finish_reason is not None:
                 chunk.finish_reason = finish_reason
-            chunk.usage = Client._build_usage_info(data)
+            chunk.usage = Client.build_usage_info(data)
             stage_name = data.get("stage_name")
             if stage_name is not None:
                 chunk.stage_name = stage_name
@@ -603,7 +603,7 @@ class Client:
             modality = data.get("modality")
             if modality is not None:
                 chunk.modality = modality
-            Client._set_audio_data(chunk, data)
+            Client.set_audio_data(chunk, data)
             return chunk
         if isinstance(data, str):
             chunk.text = data
@@ -615,7 +615,7 @@ class Client:
         return chunk
 
 
-def _extract_inputs(request: GenerateRequest) -> Any:
+def extract_inputs(request: GenerateRequest) -> Any:
     choices = [
         request.prompt is not None,
         request.prompt_token_ids is not None,
@@ -673,7 +673,7 @@ def _extract_inputs(request: GenerateRequest) -> Any:
     return messages
 
 
-def _build_params(request: GenerateRequest) -> dict[str, Any]:
+def build_params(request: GenerateRequest) -> dict[str, Any]:
     params = request.sampling.to_dict()
     max_new_tokens = request.sampling.max_new_tokens
     if request.max_tokens is not None:
