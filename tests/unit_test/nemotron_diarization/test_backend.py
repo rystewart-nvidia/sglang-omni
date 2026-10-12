@@ -130,7 +130,7 @@ def test_checkpoint_validator_rejects_other_nemo_layouts(tmp_path, overrides):
 
 def test_local_checkpoint_directory_does_not_select_an_arbitrary_archive(tmp_path):
     (tmp_path / "unrelated.nemo").touch()
-    with pytest.raises(FileNotFoundError, match="Nemotron-3-Diarization-preview.nemo"):
+    with pytest.raises(FileNotFoundError, match="Nemotron-3-Diarization.nemo"):
         resolve_nemo_checkpoint(str(tmp_path))
 
 

@@ -7,7 +7,7 @@ from sglang_omni.config import FactoryArgs, PipelineConfig, StageConfig
 
 
 class NemotronDiarizationPipelineConfig(PipelineConfig):
-    architecture: ClassVar[str] = "SortformerEncLabelModel"
+    architecture: ClassVar[str] = "Nemotron3DiarizationForAudioFrameClassification"
 
     stages: list[StageConfig] = [
         StageConfig(

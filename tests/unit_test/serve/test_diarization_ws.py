@@ -39,7 +39,7 @@ class SessionCoordinator:
         pass
 
 
-def connection(coordinator, architecture="SortformerEncLabelModel"):
+def connection(coordinator, architecture="Nemotron3DiarizationForAudioFrameClassification"):
     app = create_app(
         Client(coordinator), model_name="diarizer", architectures=[architecture]
     )

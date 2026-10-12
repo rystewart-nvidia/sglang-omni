@@ -1,6 +1,6 @@
 # Nemotron 3 Diarization
 
-[NVIDIA Nemotron 3 Diarization preview](https://huggingface.co/nvidia/Nemotron-3-Diarization-preview)
+[NVIDIA Nemotron 3 Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization)
 is a Sortformer model that identifies up to eight speakers in a recording,
 including overlapping speech. SGLang-Omni serves it through
 `/v1/audio/diarizations`, which returns speaker labels and timestamps.
@@ -27,7 +27,7 @@ set `model_path` in your YAML configuration:
 
 ```yaml
 config_cls: NemotronDiarizationPipelineConfig
-model_path: /path/to/Nemotron-3-Diarization-preview.nemo
+model_path: /path/to/Nemotron-3-Diarization.nemo
 ```
 
 You can also point `model_path` to a directory containing that file. Use

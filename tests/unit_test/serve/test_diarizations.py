@@ -22,7 +22,7 @@ class RecordingCoordinator:
         return self.result
 
 
-def make_client(result, architecture="SortformerEncLabelModel"):
+def make_client(result, architecture="Nemotron3DiarizationForAudioFrameClassification"):
     coordinator = RecordingCoordinator(result)
     app = create_app(
         Client(coordinator), model_name="diarizer", architectures=[architecture]
@@ -118,7 +118,7 @@ def test_diarization_error_crosses_client_boundary_with_expected_status(
             raise ClientError(message)
 
     app = create_app(
-        Client(FailingCoordinator()), architectures=["SortformerEncLabelModel"]
+        Client(FailingCoordinator()), architectures=["Nemotron3DiarizationForAudioFrameClassification"]
     )
     response = TestClient(app).post(
         "/v1/audio/diarizations", files={"file": ("bad.wav", b"bad")}

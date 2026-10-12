@@ -1,2 +1,2 @@
 config_cls: NemotronDiarizationPipelineConfig
-model_path: nvidia/Nemotron-3-Diarization-preview@f10b424fe5189402c8aa8112a1cbe8c341450b84
+model_path: nvidia/Nemotron-3-Diarization@f667ed73aee57d40cc39428eb768b4fd87a0a29e

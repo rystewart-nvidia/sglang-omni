@@ -13,7 +13,7 @@ import yaml
 
 from sglang_omni.client.types import DiarizationResult, DiarizationSegment
 
-CHECKPOINT_FILENAME = "Nemotron-3-Diarization-preview.nemo"
+CHECKPOINT_FILENAME = "Nemotron-3-Diarization.nemo"
 SAMPLE_RATE = 16000
 _PROFILES = {
     # Cache, FIFO, chunk, right context and update period, in 80 ms frames.
@@ -81,7 +81,6 @@ _DEFAULT_CONFIG = {
         "use_grads": False,
     },
     "encoder": {"rope_base": 10000.0, "rotary_fraction": 1.0, "causal_tail_len": 0},
-    "sortformer_modules": {"use_activity_head": False},
 }
 
 
@@ -139,7 +138,6 @@ def validate_checkpoint(path: Path) -> None:
         and config.get("streaming_mode") is True
         and config.get("max_num_of_spks") == 8
         and config.get("transformer_encoder") is None
-        and not config.get("activity_weight", 0)
     ):
         raise ValueError(
             "Checkpoint is not the supported Nemotron 3 diarization layout"
@@ -174,6 +172,9 @@ class NemotronDiarizer:
         with torch.device("meta"):
             self.model = NemotronDiarizationModel(profile=_PROFILES[profile])
         weights = load_checkpoint_weights(checkpoint)
+        # note (Richard Wang): The activity head only trains an auxiliary loss.
+        for name in [name for name in weights if ".activity_head." in name]:
+            weights.pop(name)
         for name, tensor in self.model.state_dict().items():
             if name in weights:
                 weights[name] = weights[name].to(dtype=tensor.dtype).contiguous()

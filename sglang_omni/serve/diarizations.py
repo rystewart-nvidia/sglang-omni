@@ -18,7 +18,7 @@ from sglang_omni.serve.openai_errors import is_bad_request_error
 from sglang_omni.serve.speech_to_text import read_and_validate_speech_to_text_audio
 
 logger = logging.getLogger(__name__)
-_SUPPORTED_ARCHITECTURES = frozenset({"SortformerEncLabelModel"})
+_SUPPORTED_ARCHITECTURES = frozenset({"Nemotron3DiarizationForAudioFrameClassification"})
 _FORM_FIELDS = frozenset({"file", "model", "response_format", "stream"})
 
 
