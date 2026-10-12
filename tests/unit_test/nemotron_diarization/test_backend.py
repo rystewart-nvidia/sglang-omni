@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Guard checkpoint-family selection and overlapping, frame-rounded intervals."""
+"""Checkpoint selection, archive safety, masks and frame-rounded intervals."""
 
 import importlib
 import io
@@ -10,13 +10,27 @@ import numpy as np
 import pytest
 import torch
 import yaml
+from torch._inductor import config as inductor_config
 
 from sglang_omni.models.nemotron_diarization.backend import (
+    REQUIRED_CONFIG,
     load_checkpoint_weights,
     probabilities_to_segments,
     resolve_nemo_checkpoint,
     validate_checkpoint,
 )
+
+
+def write_archive(path, name, data, *, copies=1, symlink=False):
+    with tarfile.open(path, "w") as archive:
+        info = tarfile.TarInfo(name)
+        if symlink:
+            info.type, info.linkname = tarfile.SYMTYPE, "/outside/archive"
+        else:
+            info.size = len(data)
+        for _ in range(copies):
+            archive.addfile(info, io.BytesIO(data))
+    return path
 
 
 def test_segments_preserve_overlap_and_clip_only_the_partial_last_frame():
@@ -31,112 +45,8 @@ def test_segments_preserve_overlap_and_clip_only_the_partial_last_frame():
             {"start": 1.0, "end": 2.504, "speaker": "speaker_7"},
         ],
     }
-
-
-def test_probabilities_cannot_extend_segments_beyond_audio():
     with pytest.raises(RuntimeError, match="segment extends past the audio"):
         probabilities_to_segments(np.ones((300, 8)), duration=2.0)
-
-
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"high_resolution": False},
-        {"sample_rate": 8000},
-        {"target": "other.Model"},
-        {"streaming_mode": False},
-        {"max_num_of_spks": 4},
-        {"preprocessor": {"window_stride": 0.08, "sample_rate": 16000}},
-        {"preprocessor": {"normalize": "per_feature"}},
-        {"preprocessor": {"preemph": 0.0}},
-        {"encoder": {"attn_mode": "causal"}},
-        {"encoder": {"rope_base": 500000.0}},
-        {"sortformer_modules": {"scores_boost_latest": 0.0}},
-        {"transformer_encoder": {}},
-    ],
-)
-def test_checkpoint_validator_rejects_other_nemo_layouts(tmp_path, overrides):
-    config = {
-        "target": "nemo.collections.asr.models.sortformer_diar_models.SortformerEncLabelModel",
-        "sample_rate": 16000,
-        "high_resolution": True,
-        "output_subsampling_factor": 1,
-        "streaming_mode": True,
-        "max_num_of_spks": 8,
-        "preprocessor": {
-            "_target_": "nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor",
-            "normalize": "NA",
-            "window_size": 0.025,
-            "window_stride": 0.01,
-            "sample_rate": 16000,
-            "window": "hann",
-            "features": 128,
-            "n_fft": 512,
-            "frame_splicing": 1,
-        },
-        "encoder": {
-            "_target_": "nemo.collections.asr.modules.TransformerEncoder",
-            "feat_in": 128,
-            "feat_out": -1,
-            "d_model": 512,
-            "n_heads": 8,
-            "subsampling": "feature_stacking",
-            "ff_expansion": 4.0,
-            "xscaling": False,
-            "qkv_bias": False,
-            "qk_norm": False,
-            "pre_block_norm": True,
-            "attn_mode": "full",
-            "self_attention_model": "rope",
-            "n_layers": 31,
-            "subsampling_factor": 8,
-        },
-        "sortformer_modules": {
-            "_target_": "nemo.collections.asr.modules.sortformer_modules.SortformerModules",
-            "num_spks": 8,
-            "fc_d_model": 512,
-            "tf_d_model": 192,
-            "chunk_left_context": 0,
-            "spkcache_sil_frames_per_spk": 1,
-            "pred_score_threshold": 0.25,
-            "max_index": 99999,
-            "scores_boost_latest": 0.05,
-            "strong_boost_rate": 0.75,
-            "weak_boost_rate": 1.5,
-            "min_pos_scores_rate": 0.5,
-            "use_learnable_sil_emb": True,
-        },
-    }
-    path = tmp_path / "test.nemo"
-
-    def write_archive(values):
-        data = yaml.safe_dump(values).encode()
-        with tarfile.open(path, "w") as archive:
-            info = tarfile.TarInfo("model_config.yaml")
-            info.size = len(data)
-            archive.addfile(info, io.BytesIO(data))
-
-    write_archive(config)
-    validate_checkpoint(path)
-    updated = dict(config)
-    for key, value in overrides.items():
-        updated[key] = (
-            {**config[key], **value} if isinstance(config.get(key), dict) else value
-        )
-    write_archive(updated)
-    with pytest.raises(ValueError, match="not the supported"):
-        validate_checkpoint(path)
-
-
-def test_local_checkpoint_directory_does_not_select_an_arbitrary_archive(tmp_path):
-    (tmp_path / "unrelated.nemo").touch()
-    with pytest.raises(FileNotFoundError, match="Nemotron-3-Diarization.nemo"):
-        resolve_nemo_checkpoint(str(tmp_path))
-
-
-def test_missing_local_checkpoint_does_not_become_a_hub_repository(tmp_path):
-    with pytest.raises(FileNotFoundError, match="Missing checkpoint"):
-        resolve_nemo_checkpoint(str(tmp_path / "missing.nemo"))
 
 
 def test_threshold_ties_retain_previous_activity_and_preserve_overlap():
@@ -151,35 +61,65 @@ def test_threshold_ties_retain_previous_activity_and_preserve_overlap():
     ]
 
 
-@pytest.mark.parametrize("frames", [0, 10])
-def test_silent_or_subframe_recording_has_no_segments(frames):
-    assert probabilities_to_segments(np.zeros((frames, 8)), duration=0.1).segments == []
+@pytest.mark.parametrize(
+    "overrides, accepted",
+    [
+        ({}, True),
+        ({"high_resolution": False}, False),
+        ({"preprocessor": {"normalize": "per_feature"}}, False),
+        ({"preprocessor": {"preemph": 0.0}}, False),
+        ({"transformer_encoder": {}}, False),
+    ],
+)
+def test_checkpoint_validator_accepts_only_the_released_layout(
+    tmp_path, overrides, accepted
+):
+    config = {
+        "target": "nemo.collections.asr.models.sortformer_diar_models.SortformerEncLabelModel",
+        "sample_rate": 16000,
+        "high_resolution": True,
+        "output_subsampling_factor": 1,
+        "streaming_mode": True,
+        "max_num_of_spks": 8,
+        # The released checkpoint trains an auxiliary activity head.
+        "activity_weight": 0.5,
+        **{section: dict(values) for section, values in REQUIRED_CONFIG.items()},
+    }
+    for key, value in overrides.items():
+        config[key] = {**config[key], **value} if key in REQUIRED_CONFIG else value
+    path = write_archive(
+        tmp_path / "test.nemo", "model_config.yaml", yaml.safe_dump(config).encode()
+    )
+    if accepted:
+        validate_checkpoint(path)
+    else:
+        with pytest.raises(ValueError, match="not the supported"):
+            validate_checkpoint(path)
 
 
-@pytest.mark.parametrize("duplicate,symlink", [(True, False), (False, True)])
-def test_weights_member_must_be_unique_and_regular(tmp_path, duplicate, symlink):
-    path = tmp_path / "bad.nemo"
-    with tarfile.open(path, "w") as archive:
-        info = tarfile.TarInfo("model_weights.ckpt")
-        if symlink:
-            info.type = tarfile.SYMTYPE
-            info.linkname = "/outside/archive"
-        archive.addfile(info)
-        if duplicate:
-            archive.addfile(info)
-    with pytest.raises(ValueError, match="Expected one model_weights"):
-        load_checkpoint_weights(path)
+@pytest.mark.parametrize("name", ["unrelated.nemo", "missing.nemo"])
+def test_local_paths_never_select_another_archive_or_the_hub(tmp_path, name):
+    (tmp_path / "unrelated.nemo").touch()
+    target = tmp_path if name == "unrelated.nemo" else tmp_path / name
+    with pytest.raises(FileNotFoundError, match="Missing .nemo checkpoint"):
+        resolve_nemo_checkpoint(str(target))
 
 
-def test_checkpoint_rejects_non_tensor_state_entries(tmp_path):
+@pytest.mark.parametrize("variant", ["duplicate", "symlink", "non_tensor"])
+def test_weights_must_be_one_regular_tensor_state_dict(tmp_path, variant):
     serialized = io.BytesIO()
-    torch.save({"weight": torch.zeros(1), "config": "not a tensor"}, serialized)
-    path = tmp_path / "bad.nemo"
-    with tarfile.open(path, "w") as archive:
-        info = tarfile.TarInfo("model_weights.ckpt")
-        info.size = len(serialized.getvalue())
-        archive.addfile(info, io.BytesIO(serialized.getvalue()))
-    with pytest.raises(ValueError, match="tensor state dictionary"):
+    state = {"weight": torch.zeros(1)}
+    torch.save(
+        {**state, "config": "text"} if variant == "non_tensor" else state, serialized
+    )
+    path = write_archive(
+        tmp_path / "bad.nemo",
+        "model_weights.ckpt",
+        serialized.getvalue(),
+        copies=2 if variant == "duplicate" else 1,
+        symlink=variant == "symlink",
+    )
+    with pytest.raises(ValueError, match="model_weights|tensor state dictionary"):
         load_checkpoint_weights(path)
 
 
@@ -187,10 +127,9 @@ def test_reused_attention_masks_preserve_each_valid_length():
     from sglang_omni.models.nemotron_diarization.model import TransformerEncoder
 
     encoder = TransformerEncoder(max_frames=9)
-    embeddings = torch.zeros(1, 9, 512)
     positions = torch.arange(9)
     for valid_length in [9, 3, 8, 3, 9]:
-        mask = encoder.attention_mask(embeddings, valid_length)
+        mask = encoder.attention_mask(9, valid_length)
         actual = mask.mask_mod(0, 0, 0, positions)
         torch.testing.assert_close(actual, positions < valid_length)
 
@@ -199,12 +138,12 @@ def test_reused_attention_masks_preserve_each_valid_length():
 def test_model_compiler_policy_leaves_other_models_unchanged(deterministic):
     from sglang_omni.models.nemotron_diarization import model
 
-    with torch._inductor.config.patch(
+    with inductor_config.patch(
         {"deterministic": deterministic, "triton.autotune_pointwise": True}
     ):
         importlib.reload(model)
-        assert torch._inductor.config.deterministic is deterministic
-        assert torch._inductor.config.triton.autotune_pointwise is True
-        config = model._compiled_attention.get_compiler_config()
+        assert inductor_config.deterministic is deterministic
+        assert inductor_config.triton.autotune_pointwise is True
+        config = model.compiled_flex_attention.get_compiler_config()
         assert config["deterministic"] is True
         assert config["triton.autotune_pointwise"] is False

@@ -795,10 +795,12 @@ class Client:
                 pass
             Client.set_audio_data(chunk, result)
             chunk.usage = Client.build_usage_info(result)
-            if result.get("diarization") is not None:
-                chunk.diarization = msgspec.convert(
-                    result["diarization"], type=DiarizationResult
-                )
+            diarization = result.get("diarization")
+            chunk.diarization = (
+                None
+                if diarization is None
+                else msgspec.convert(diarization, type=DiarizationResult)
+            )
             return chunk
         else:
             pass

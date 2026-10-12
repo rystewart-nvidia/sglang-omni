@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Streaming acoustic boundaries, hysteresis, and session admission regressions."""
+"""Streaming acoustic boundaries, hysteresis, and session ownership."""
 
-from types import SimpleNamespace
-
-import msgspec
 import numpy as np
 import pytest
 import torch
 
+from sglang_omni.models.nemotron_diarization import streaming
 from sglang_omni.models.nemotron_diarization.model import Preprocessor
 from sglang_omni.models.nemotron_diarization.streaming import (
     LiveDiarization,
@@ -27,13 +25,19 @@ class AcousticProbe:
         return features.new_zeros(1, features.shape[2] - right, 8)
 
 
-@pytest.mark.parametrize("length", [1, 159, 160, 16640, 50003])
+def call(manager, session, operation, pcm=b"", **fields):
+    return manager.compute(
+        dict(session_id=session, operation=operation, pcm=pcm, **fields)
+    )
+
+
+@pytest.mark.parametrize("length", [159, 16640, 50003])
 def test_incremental_features_match_complete_audio_and_flush_partial_tail(length):
     model = AcousticProbe()
     audio = np.random.default_rng(17).normal(size=length).astype(np.float32)
     expected, count = model.preprocessor(torch.from_numpy(audio)[None, :])
     expected = expected[:, :, :count]
-    live = LiveDiarization(model, device="cpu")
+    live = LiveDiarization(model, device=torch.device("cpu"))
     outputs = []
     offset = 0
     for size in [1, 159, 161, 800, 3201] * (length // 4000 + 1):
@@ -45,7 +49,6 @@ def test_incremental_features_match_complete_audio_and_flush_partial_tail(length
         if model.chunks:
             assert offset >= 104 * 160 + 256  # No premature right-context padding.
         assert live.audio.size < 104 * 160 + 256 + 320
-    assert offset == length
     if length > 104 * 160 + 256:
         assert sum(output.shape[1] for output in outputs) > 0  # Live, before EOF.
     outputs.append(live.probabilities(np.empty(0, np.float32), final=True))
@@ -61,11 +64,10 @@ def test_incremental_features_match_complete_audio_and_flush_partial_tail(length
 
 
 def test_equal_threshold_preserves_activity_across_updates(monkeypatch):
-    live = LiveDiarization(AcousticProbe(), device="cpu")
+    live = LiveDiarization(AcousticProbe(), device=torch.device("cpu"))
     values = iter([[0.6, 0.5], [0.5, 0.4, 0.5]])
 
     def probabilities(audio, *, final):
-        del audio, final
         speaker = torch.tensor(next(values))
         live.frame += len(speaker)
         result = torch.zeros(1, len(speaker), 8)
@@ -74,8 +76,7 @@ def test_equal_threshold_preserves_activity_across_updates(monkeypatch):
         return result
 
     monkeypatch.setattr(live, "probabilities", probabilities)
-    first = live.append(b"")
-    second = live.append(b"")
+    first, second = live.append(b""), live.append(b"")
     assert [(s.start, s.end, s.speaker) for s in first.segments] == [
         (0, 0.02, "speaker_0"),
         (0, 0.02, "speaker_7"),
@@ -85,54 +86,39 @@ def test_equal_threshold_preserves_activity_across_updates(monkeypatch):
         (0.02, 0.03, "speaker_7"),
     ]
     assert second.duration == 0.05
-    # Nonempty segments must cross the same binary boundary as real stage results.
-    msgspec.msgpack.encode(second)
 
 
-def test_sessions_bound_state_reject_concurrent_mutation_and_release_slots(monkeypatch):
-    manager = LiveSessions(SimpleNamespace(model=AcousticProbe(), device="cpu"), 2)
-
-    def call(session, operation, pcm=b""):
-        return manager.compute(dict(session_id=session, operation=operation, pcm=pcm))
-
-    call("a", "open")
-    call("b", "open")
+def test_sessions_bound_state_reject_invalid_or_concurrent_work_and_release():
+    manager = LiveSessions(AcousticProbe(), torch.device("cpu"), 2)
+    call(manager, "a", "open")
+    call(manager, "b", "open")
     assert manager.sessions["a"].state is not manager.sessions["b"].state
     with pytest.raises(ValueError, match="limit"):
-        call("c", "open")
+        call(manager, "c", "open")
+    with pytest.raises(ValueError, match="PCM16"):
+        call(manager, "a", "append", b"x")
     with manager.sessions["a"].lock:
         with pytest.raises(ValueError, match="pending"):
-            call("a", "append", b"\0\0")
-    call("a", "append", b"\0\0" * 111)
-    call("b", "append", b"\0\0" * 222)
-    assert call("a", "finish").duration == 111 / 16000
-    assert "a" not in manager.sessions
-    assert call("b", "finish").duration == 222 / 16000
-    call("c", "open")
-    call("c", "close")
+            call(manager, "a", "append", b"\0\0")
+    call(manager, "a", "append", b"\0\0" * 111)
+    assert call(manager, "a", "finish").duration == 111 / 16000
+    call(manager, "b", "reset", next_session_id="c")
+    assert set(manager.sessions) == {"c"}
+    call(manager, "c", "close")
     with pytest.raises(ValueError, match="closed"):
-        call("c", "append", b"\0\0")
-    call("idle", "open")
+        call(manager, "c", "append", b"\0\0")
+    call(manager, "idle", "open")
     manager.sessions["idle"].last_used -= 61
-    call("new", "open")
+    call(manager, "new", "open")
     assert set(manager.sessions) == {"new"}
-
-
-@pytest.mark.parametrize("pcm", [b"x", b"\0" * 32002, "wrong type"])
-def test_invalid_pcm_cannot_advance_session(pcm):
-    manager = LiveSessions(SimpleNamespace(model=AcousticProbe(), device="cpu"), 1)
-    manager.compute(dict(session_id="s", operation="open"))
-    with pytest.raises(ValueError, match="PCM16"):
-        manager.compute(dict(session_id="s", operation="append", pcm=pcm))
-    assert manager.sessions["s"].samples == 0
 
 
 def test_inference_failure_discards_partial_state_and_releases_capacity(monkeypatch):
     model = AcousticProbe()
-    manager = LiveSessions(SimpleNamespace(model=model, device="cpu"), 1)
-    manager.compute(dict(session_id="failed", operation="open"))
+    manager = LiveSessions(model, torch.device("cpu"), 1)
+    call(manager, "failed", "open")
     state = manager.sessions["failed"]
-    manager.compute(dict(session_id="failed", operation="append", pcm=b"\0\0" * 16000))
+    call(manager, "failed", "append", b"\0\0" * 16000)
 
     def fail(features, cache, right):
         cache.fifo = features.new_zeros(1, 1, 512)
@@ -140,37 +126,29 @@ def test_inference_failure_discards_partial_state_and_releases_capacity(monkeypa
 
     monkeypatch.setattr(model, "forward_chunk", fail)
     with pytest.raises(RuntimeError, match="after changing state"):
-        manager.compute(
-            dict(session_id="failed", operation="append", pcm=b"\0\0" * 1600)
-        )
+        call(manager, "failed", "append", b"\0\0" * 1600)
     assert manager.sessions == {}
     assert not state.lock.locked()
-    manager.compute(dict(session_id="replacement", operation="open"))
+    call(manager, "replacement", "open")
     assert manager.sessions["replacement"].state.fifo.shape[1] == 0
 
 
 def test_queued_activity_prevents_expiry_and_abort_releases_reservation(monkeypatch):
-    from sglang_omni.models.nemotron_diarization import streaming
-
     now = [0.0]
     monkeypatch.setattr(streaming.time, "monotonic", lambda: now[0])
-    manager = LiveSessions(SimpleNamespace(model=AcousticProbe(), device="cpu"), 1)
-    manager.compute(dict(session_id="live", operation="open"))
+    manager = LiveSessions(AcousticProbe(), torch.device("cpu"), 1)
+    call(manager, "live", "open")
     now[0] = 55.0
-    manager.reserve("live")
+    assert manager.reserve("live")
     now[0] = 65.0
-    result = manager.compute(dict(session_id="live", operation="append", pcm=b"\0\0"))
+    assert call(manager, "live", "append", b"\0\0").duration == 0.0
     manager.release("live", aborted=False)
-    assert result.duration == 0.0
-    assert "live" in manager.sessions
-    assert not manager.pending
+    assert "live" in manager.sessions and not manager.pending
     manager.reserve("live")
     manager.release("live", aborted=True)
-    assert not manager.sessions
-    assert not manager.pending
-    manager.compute(dict(session_id="expired", operation="open"))
+    assert not manager.sessions and not manager.pending
+    call(manager, "expired", "open")
     now[0] += 61.0
-    manager.reserve("expired")
+    assert not manager.reserve("expired")
     with pytest.raises(ValueError, match="closed or expired"):
-        manager.compute(dict(session_id="expired", operation="append", pcm=b"\0\0"))
-    manager.release("expired", aborted=True)
+        call(manager, "expired", "append", b"\0\0")

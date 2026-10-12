@@ -4,7 +4,8 @@
 
 Adapted from NVIDIA-NeMo/Speech sortformer_modules.py at revision
 2c1a2f91d64566b5d391b83df42f9ab4cd810adb. Omni changes: synchronous, single
-recording, inference only; learned silence embeddings and fixed scoring settings.
+recording, inference only, with learned silence embeddings and fixed scoring
+settings.
 """
 
 import math
@@ -40,6 +41,10 @@ class SpeakerCache:
             if self.cache.shape[1] > self.cache_size:
                 self.compress(silence_embedding)
                 self.compressed = True
+            else:
+                pass
+        else:
+            pass
         self.fifo = fifo
 
     def compress(self, silence_embedding):

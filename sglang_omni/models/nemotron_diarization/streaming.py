@@ -10,18 +10,23 @@ import numpy as np
 import torch
 
 from sglang_omni.client.types import DiarizationResult
-from sglang_omni.models.nemotron_diarization.backend import probabilities_to_segments
+from sglang_omni.models.nemotron_diarization.backend import (
+    PROFILES,
+    SAMPLE_RATE,
+    probabilities_to_segments,
+)
+from sglang_omni.models.nemotron_diarization.model import NemotronDiarizationModel
 from sglang_omni.models.nemotron_diarization.speaker_cache import SpeakerCache
 
-SAMPLE_RATE = 16000
 MAX_AUDIO_BYTES = SAMPLE_RATE * 2  # At most one second of PCM16 per message.
 SESSION_IDLE_SECONDS = 60
+OPERATIONS = ("open", "append", "finish", "close", "reset")
 
 
 class LiveDiarization:
     """Keep acoustic context and speaker identity without retaining the recording."""
 
-    def __init__(self, model, *, device):
+    def __init__(self, model: NemotronDiarizationModel, *, device: torch.device):
         self.model = model
         self.device = device
         self.audio = np.empty(0, dtype=np.float32)
@@ -29,34 +34,41 @@ class LiveDiarization:
         self.samples = 0
         self.frame = 0
         self.active = np.zeros(8, dtype=bool)
-        # The published low-latency profile: 720 ms chunks, 320 ms lookahead.
+        # Live audio uses the published low-latency profile.
+        cache_size, fifo_size, chunk_size, right_context, update_period = PROFILES[
+            "low_latency"
+        ]
+        self.chunk_frames, self.right_frames = chunk_size * 8, right_context * 8
         self.state = SpeakerCache(
             torch.empty(0, device=device),
-            cache_size=264,
-            fifo_size=264,
-            update_period=222,
+            cache_size=cache_size,
+            fifo_size=fifo_size,
+            update_period=update_period,
         )
         self.lock = threading.Lock()
         self.last_used = time.monotonic()
         self.finished = False
 
     @torch.inference_mode()
-    def probabilities(self, audio: np.ndarray, *, final: bool = False):
+    def probabilities(self, audio: np.ndarray, *, final: bool = False) -> torch.Tensor:
         if self.finished:
             raise ValueError("Diarization stream has finished")
-        if audio.ndim != 1 or not np.isfinite(audio).all():
+        elif audio.ndim != 1 or not np.isfinite(audio).all():
             raise ValueError("Expected finite mono audio")
+        else:
+            pass
         self.audio = np.concatenate([self.audio, audio])
         self.samples += len(audio)
         outputs = []
         while self.frame < self.samples // 160:
             available = self.samples // 160 - self.frame
-            count = min(72, available)
-            right = min(32, available - count)
+            count = min(self.chunk_frames, available)
+            right = min(self.right_frames, available - count)
             # Centered STFT needs future samples as well as encoder lookahead.
-            if not final and self.samples < (self.frame + 104) * 160 + 256:
+            window_frames = self.chunk_frames + self.right_frames
+            if not final and self.samples < (self.frame + window_frames) * 160 + 256:
                 break
-            if self.state.cache.is_cuda:
+            elif self.state.cache.is_cuda:
                 # Successive messages can run on different workers. Keep old
                 # cache storage alive until this stream finishes reading it.
                 stream = torch.cuda.current_stream(self.device)
@@ -66,6 +78,8 @@ class LiveDiarization:
                     self.state.cache_preds,
                 ):
                     tensor.record_stream(stream)
+            else:
+                pass
             offset = (self.frame * 160 - self.buffer_start) // 160
             end = (offset + count + right) * 160 + 256
             signal = torch.as_tensor(
@@ -82,8 +96,7 @@ class LiveDiarization:
             self.audio = self.audio[keep_from - self.buffer_start :].copy()
             self.buffer_start = keep_from
         self.finished = final
-        if final:
-            self.audio = np.empty(0, dtype=np.float32)
+        self.audio = np.empty(0, dtype=np.float32) if final else self.audio
         return (
             torch.cat(outputs, dim=1)
             if outputs
@@ -93,92 +106,103 @@ class LiveDiarization:
     def append(self, pcm: bytes, *, final: bool = False) -> DiarizationResult:
         start_frame = self.frame
         audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768
-        predictions = self.probabilities(audio, final=final)[0]
-        duration = self.samples / SAMPLE_RATE if final else self.frame / 100
-        if not predictions.shape[0]:
-            return DiarizationResult(duration=duration, segments=[])
+        predictions = self.probabilities(audio, final=final)[0].cpu().numpy()
         return probabilities_to_segments(
-            predictions.cpu().numpy(),
-            duration=duration,
+            predictions,
+            duration=self.samples / SAMPLE_RATE if final else self.frame / 100,
             start_frame=start_frame,
             active=self.active,
         )
 
 
 class LiveSessions:
-    """Worker-side session admission; the WebSocket owns each session's lifetime."""
+    """Worker-side session admission, while the WebSocket owns each session."""
 
-    def __init__(self, diarizer, max_sessions: int):
-        self.diarizer = diarizer
+    def __init__(
+        self, model: NemotronDiarizationModel, device: torch.device, max_sessions: int
+    ):
+        self.model = model
+        self.device = device
         self.max_sessions = max_sessions
         self.sessions: dict[str, LiveDiarization] = {}
-        self.lock = threading.Lock()
         self.pending: dict[str, int] = {}
+        self.lock = threading.Lock()
 
-    def reserve(self, session_id: str) -> None:
-        """Pin accepted activity through scheduler queueing and execution."""
-        with self.lock:
-            state = self.sessions.get(session_id)
+    def expire_idle_sessions(self) -> None:
+        now = time.monotonic()
+        for session_id, state in list(self.sessions.items()):
             if (
-                state is not None
+                session_id not in self.pending
                 and not state.lock.locked()
-                and session_id not in self.pending
-                and time.monotonic() - state.last_used > SESSION_IDLE_SECONDS
+                and now - state.last_used > SESSION_IDLE_SECONDS
             ):
-                del self.sessions[session_id]
+                self.sessions.pop(session_id)
+            else:
+                pass
+
+    def reserve(self, session_id: str) -> bool:
+        """Pin accepted activity, returning whether it continues an idle session."""
+        with self.lock:
+            self.expire_idle_sessions()
+            continues = session_id in self.sessions and session_id not in self.pending
             self.pending[session_id] = self.pending.get(session_id, 0) + 1
+            return continues
 
     def release(self, session_id: str, *, aborted: bool) -> None:
         with self.lock:
-            remaining = self.pending.get(session_id, 1) - 1
+            remaining = self.pending.pop(session_id, 1) - 1
             if remaining:
                 self.pending[session_id] = remaining
             else:
-                self.pending.pop(session_id, None)
+                pass
             if aborted:
                 self.sessions.pop(session_id, None)
+            else:
+                pass
 
     def close(self) -> None:
         with self.lock:
             self.sessions.clear()
             self.pending.clear()
 
-    def compute(self, inputs) -> DiarizationResult:
-        session_id = inputs["session_id"]
-        operation = inputs["operation"]
+    def compute(self, inputs: dict[str, str | bytes]) -> DiarizationResult:
+        session_id, operation = inputs["session_id"], inputs["operation"]
         pcm = inputs.get("pcm", b"")
+        # A reset replaces the session in one operation, so it never needs a
+        # second session slot.
+        opened = inputs["next_session_id"] if operation == "reset" else session_id
         if not isinstance(pcm, bytes) or len(pcm) % 2 or len(pcm) > MAX_AUDIO_BYTES:
             raise ValueError("Expected at most one second of mono PCM16 audio")
-        if operation not in {"open", "append", "finish", "close"}:
+        elif operation not in OPERATIONS:
             raise ValueError("Unknown diarization stream operation")
-        if operation != "append" and pcm:
+        elif pcm and operation != "append":
             raise ValueError("Only append accepts audio")
+        else:
+            pass
         with self.lock:
-            now = time.monotonic()
-            for key, state in list(self.sessions.items()):
-                if (
-                    key not in self.pending
-                    and not state.lock.locked()
-                    and now - state.last_used > SESSION_IDLE_SECONDS
-                ):
-                    del self.sessions[key]
-            if operation == "close":
-                self.sessions.pop(session_id, None)
-                return DiarizationResult(duration=0, segments=[])
-            if operation == "open":
-                if session_id in self.sessions:
-                    raise ValueError("Diarization session already exists")
-                if len(self.sessions) >= self.max_sessions:
-                    raise ValueError("Live diarization session limit reached")
-                self.sessions[session_id] = LiveDiarization(
-                    self.diarizer.model, device=self.diarizer.device
-                )
-                return DiarizationResult(duration=0, segments=[])
+            self.expire_idle_sessions()
             state = self.sessions.get(session_id)
-            if state is None:
+            if operation in ("close", "reset"):
+                self.sessions.pop(session_id, None)
+            else:
+                pass
+            if operation == "close":
+                return DiarizationResult(duration=0, segments=[])
+            elif operation in ("open", "reset") and opened in self.sessions:
+                raise ValueError("Diarization session already exists")
+            elif operation in ("open", "reset") and len(self.sessions) >= (
+                self.max_sessions
+            ):
+                raise ValueError("Live diarization session limit reached")
+            elif operation in ("open", "reset"):
+                self.sessions[opened] = LiveDiarization(self.model, device=self.device)
+                return DiarizationResult(duration=0, segments=[])
+            elif state is None:
                 raise ValueError("Diarization session is closed or expired")
-            if not state.lock.acquire(blocking=False):
+            elif not state.lock.acquire(blocking=False):
                 raise ValueError("Diarization session already has a pending operation")
+            else:
+                pass
         try:
             return state.append(pcm, final=operation == "finish")
         except Exception:
@@ -191,3 +215,5 @@ class LiveSessions:
                 state.lock.release()
                 if operation == "finish":
                     self.sessions.pop(session_id, None)
+                else:
+                    pass

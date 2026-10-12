@@ -11,11 +11,17 @@ import uuid
 import msgspec
 from fastapi import WebSocket, WebSocketDisconnect
 
-from sglang_omni.client import Client, GenerateRequest
+from sglang_omni.admission import QueueFullError
+from sglang_omni.client import Client, DiarizationResult, GenerateRequest
 
 logger = logging.getLogger(__name__)
-_MAX_AUDIO_BYTES = 32000
-_IDLE_SECONDS = 60
+MAX_AUDIO_BYTES = 32000
+IDLE_SECONDS = 60
+CONTROL_EVENTS = ("audio.end", "session.reset")
+
+
+def new_session_id() -> str:
+    return f"diarization-live-{uuid.uuid4()}"
 
 
 class DiarizationSession:
@@ -23,11 +29,11 @@ class DiarizationSession:
         self.websocket = websocket
         self.client = client
         self.model_name = model_name
-        self.session_id = f"diarization-live-{uuid.uuid4()}"
+        self.session_id = new_session_id()
         self.messages: asyncio.Queue[bytes | str] = asyncio.Queue(maxsize=8)
-        self.end = 0.0
+        self.end_s = 0.0
 
-    async def run(self):
+    async def run(self) -> None:
         receiver = asyncio.create_task(self.receive())
         worker = asyncio.create_task(self.process())
         try:
@@ -52,78 +58,91 @@ class DiarizationSession:
                 # A separate close request releases persistent state even if the
                 # active chunk was canceled while physical inference continued.
                 await self.request("close")
-            except Exception:
-                logger.exception(
-                    "Failed to close diarization session %s", self.session_id
-                )
+            except Exception as exc:
+                # A close that admission rejected has already released the session.
+                if not QueueFullError.matches(exc):
+                    logger.exception(
+                        "Failed to close diarization session %s", self.session_id
+                    )
+                else:
+                    pass
             try:
                 await self.websocket.close()
             except (WebSocketDisconnect, RuntimeError):
                 pass
 
-    async def receive(self):
+    async def receive(self) -> None:
         while True:
             try:
-                message = await asyncio.wait_for(
-                    self.websocket.receive(), _IDLE_SECONDS
-                )
+                message = await asyncio.wait_for(self.websocket.receive(), IDLE_SECONDS)
             except TimeoutError:
                 raise ValueError(
                     "Diarization session timed out waiting for audio"
                 ) from None
+            audio = message.get("bytes")
+            text = message.get("text")
+            event = None if audio is not None else json.loads(text or "null")
             if message["type"] == "websocket.disconnect":
                 raise WebSocketDisconnect()
-            audio = message.get("bytes")
-            if audio is not None:
-                if not audio or len(audio) % 2 or len(audio) > _MAX_AUDIO_BYTES:
-                    raise ValueError(
-                        "Send 1–16000 samples of mono 16 kHz PCM16 per message"
-                    )
-                item = audio
+            elif audio is not None and (
+                not audio or len(audio) % 2 or len(audio) > MAX_AUDIO_BYTES
+            ):
+                raise ValueError(
+                    "Send 1 to 16000 samples of mono 16 kHz PCM16 per message"
+                )
+            elif audio is None and (
+                not isinstance(event, dict)
+                or set(event) != {"type"}
+                or event["type"] not in CONTROL_EVENTS
+            ):
+                raise ValueError("Expected audio.end or session.reset")
             else:
-                event = json.loads(message.get("text") or "null")
-                if not isinstance(event, dict) or set(event) != {"type"}:
-                    raise ValueError("Expected audio.end or session.reset")
-                item = event["type"]
-                if item not in ("audio.end", "session.reset"):
-                    raise ValueError("Expected audio.end or session.reset")
+                pass
             try:
-                self.messages.put_nowait(item)
+                self.messages.put_nowait(event["type"] if audio is None else audio)
             except asyncio.QueueFull:
                 raise ValueError(
-                    "Audio queue is full; wait for audio.ack before sending more"
+                    "Audio queue is full, wait for audio.ack before sending more"
                 ) from None
 
-    async def request(self, operation: str, pcm: bytes = b""):
-        request_id = f"{self.session_id}-{uuid.uuid4()}"
+    async def request(self, operation: str, pcm: bytes = b"") -> DiarizationResult:
+        prompt = {"session_id": self.session_id, "operation": operation, "pcm": pcm}
+        if operation == "reset":
+            # Name the replacement first, so teardown closes it even if this is
+            # canceled.
+            self.session_id = prompt["next_session_id"] = new_session_id()
+        else:
+            pass
+        request_id = f"{prompt['session_id']}-{uuid.uuid4()}"
         generation = GenerateRequest(
             model=self.model_name,
-            prompt={"session_id": self.session_id, "operation": operation, "pcm": pcm},
+            prompt=prompt,
             stream=False,
             metadata={"task": "diarization_stream"},
         )
         completion = asyncio.create_task(
             self.client.completion(generation, request_id=request_id)
         )
+        admits_session = operation in ("open", "reset")
         try:
-            result = (
-                await asyncio.shield(completion)
-                if operation == "open"
-                else await completion
+            result = await (
+                asyncio.shield(completion) if admits_session else completion
             )
-            if result.diarization is None:
-                raise RuntimeError("Model returned no diarization result")
-            return result.diarization
         except asyncio.CancelledError:
-            if operation == "open":
-                # Finish admission before close, so a canceled open cannot
-                # create orphaned state after the close operation ran.
+            if admits_session:
+                # Finish admission before close, so a canceled open or reset
+                # cannot create orphaned state after the close operation ran.
                 await completion
             else:
                 await self.client.abort(request_id)
             raise
+        if result.diarization is None:
+            raise RuntimeError("Model returned no diarization result")
+        else:
+            pass
+        return result.diarization
 
-    async def ready(self):
+    async def ready(self) -> None:
         await self.websocket.send_json(
             {
                 "type": "session.ready",
@@ -131,41 +150,44 @@ class DiarizationSession:
                 "sample_rate": 16000,
                 "format": "pcm16",
                 "channels": 1,
-                "max_audio_bytes": _MAX_AUDIO_BYTES,
+                "max_audio_bytes": MAX_AUDIO_BYTES,
             }
         )
 
-    async def process(self):
+    async def process(self) -> None:
         await self.request("open")
         await self.ready()
         while True:
             item = await self.messages.get()
             if item == "session.reset":
-                await self.request("close")
-                self.session_id = f"diarization-live-{uuid.uuid4()}"
-                await self.request("open")
-                self.end = 0.0
+                await self.request("reset")
+                self.end_s = 0.0
                 await self.ready()
                 continue
+            else:
+                pass
             final = item == "audio.end"
             result = await self.request(
                 "finish" if final else "append", b"" if final else item
             )
-            if result.duration > self.end:
+            if result.duration > self.end_s:
                 await self.websocket.send_json(
                     {
                         "type": "diarization.update",
-                        "start": self.end,
+                        "start": self.end_s,
                         "end": result.duration,
                         "segments": msgspec.to_builtins(result.segments),
                     }
                 )
-                self.end = result.duration
+                self.end_s = result.duration
+            else:
+                pass
             if final:
                 await self.websocket.send_json(
-                    {"type": "diarization.done", "duration": self.end}
+                    {"type": "diarization.done", "duration": self.end_s}
                 )
                 return
-            await self.websocket.send_json(
-                {"type": "audio.ack", "processed_until": self.end}
-            )
+            else:
+                await self.websocket.send_json(
+                    {"type": "audio.ack", "processed_until": self.end_s}
+                )

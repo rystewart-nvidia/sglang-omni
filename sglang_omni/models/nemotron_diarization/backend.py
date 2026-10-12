@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Native checkpoint loading and inference; NeMo is only a test reference."""
+"""Native checkpoint loading and speaker interval decoding."""
 
 from __future__ import annotations
 
@@ -10,12 +10,14 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
+from huggingface_hub import hf_hub_download
 
 from sglang_omni.client.types import DiarizationResult, DiarizationSegment
+from sglang_omni.models.nemotron_diarization.model import NemotronDiarizationModel
 
 CHECKPOINT_FILENAME = "Nemotron-3-Diarization.nemo"
 SAMPLE_RATE = 16000
-_PROFILES = {
+PROFILES = {
     # Cache, FIFO, chunk, right context and update period, in 80 ms frames.
     "offline": (264, 40, 340, 40, 300),
     "low_latency": (264, 264, 9, 4, 222),
@@ -24,7 +26,7 @@ _PROFILES = {
 # Native inference implements this published architecture only. In particular,
 # shape-compatible changes to normalization, attention or cache scoring must not
 # silently load with different semantics. Training-only settings are irrelevant.
-_REQUIRED_CONFIG = {
+REQUIRED_CONFIG = {
     "preprocessor": {
         "_target_": "nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor",
         "normalize": "NA",
@@ -69,7 +71,7 @@ _REQUIRED_CONFIG = {
         "use_learnable_sil_emb": True,
     },
 }
-_DEFAULT_CONFIG = {
+DEFAULT_CONFIG = {
     "preprocessor": {
         "preemph": 0.97,
         "log": True,
@@ -85,33 +87,28 @@ _DEFAULT_CONFIG = {
 
 
 def resolve_nemo_checkpoint(model_path: str) -> Path:
+    """Return a local archive, downloading only the archive from a hub repository."""
     path = Path(model_path).expanduser()
-    if path.is_file():
-        if path.suffix != ".nemo":
-            raise ValueError("Nemotron diarization requires a .nemo checkpoint")
-        return path
     if path.is_dir():
-        checkpoint = path / CHECKPOINT_FILENAME
-        if not checkpoint.is_file():
-            raise FileNotFoundError(f"Missing checkpoint: {checkpoint}")
-        return checkpoint
-    if (
-        path.is_absolute()
+        path = path / CHECKPOINT_FILENAME
+    elif (
+        path.suffix == ".nemo"
+        or path.is_absolute()
         or model_path.startswith((".", "~"))
-        or path.suffix == ".nemo"
     ):
-        raise FileNotFoundError(f"Missing checkpoint: {path}")
-
-    from huggingface_hub import hf_hub_download
-
-    repo_id, _, revision = model_path.partition("@")
-    return Path(
-        hf_hub_download(
-            repo_id=repo_id,
-            filename=CHECKPOINT_FILENAME,
-            revision=revision or None,
+        pass
+    else:
+        repo_id, _, revision = model_path.partition("@")
+        path = Path(
+            hf_hub_download(
+                repo_id=repo_id, filename=CHECKPOINT_FILENAME, revision=revision or None
+            )
         )
-    )
+    if path.suffix != ".nemo" or not path.is_file():
+        raise FileNotFoundError(f"Missing .nemo checkpoint: {path}")
+    else:
+        pass
+    return path
 
 
 def validate_checkpoint(path: Path) -> None:
@@ -124,12 +121,13 @@ def validate_checkpoint(path: Path) -> None:
         ]
         if len(configs) != 1 or not configs[0].isfile() or configs[0].size > 1024**2:
             raise ValueError("Expected one model_config.yaml in the .nemo archive")
+        else:
+            pass
         with archive.extractfile(configs[0]) as handle:
             config = yaml.safe_load(handle)
-    if not isinstance(config, dict):
-        raise ValueError("Invalid Nemotron diarization configuration")
     if not (
-        all(isinstance(config.get(section), dict) for section in _REQUIRED_CONFIG)
+        isinstance(config, dict)
+        and all(isinstance(config.get(section), dict) for section in REQUIRED_CONFIG)
         and config.get("target")
         == "nemo.collections.asr.models.sortformer_diar_models.SortformerEncLabelModel"
         and config.get("sample_rate") == SAMPLE_RATE
@@ -142,78 +140,76 @@ def validate_checkpoint(path: Path) -> None:
         raise ValueError(
             "Checkpoint is not the supported Nemotron 3 diarization layout"
         )
-    for section, expected in _REQUIRED_CONFIG.items():
-        if any(config[section].get(key) != value for key, value in expected.items()):
-            raise ValueError(f"Checkpoint is not the supported {section} configuration")
-    for section, expected in _DEFAULT_CONFIG.items():
+    else:
+        pass
+    for section in REQUIRED_CONFIG:
+        values = config[section]
         if any(
-            config[section].get(key, value) != value for key, value in expected.items()
+            values.get(key) != value for key, value in REQUIRED_CONFIG[section].items()
+        ) or any(
+            values.get(key, value) != value
+            for key, value in DEFAULT_CONFIG.get(section, {}).items()
         ):
             raise ValueError(f"Checkpoint is not the supported {section} configuration")
-
-
-class NemotronDiarizer:
-    def __init__(
-        self, model_path: str, *, device: torch.device, profile: str = "offline"
-    ):
-        if profile not in _PROFILES:
-            raise ValueError(
-                f"Unknown diarization profile {profile!r}; use {list(_PROFILES)}"
-            )
-        if torch.device(device).type != "cuda":
-            raise ValueError("Nemotron 3 diarization requires an NVIDIA CUDA device")
-        from sglang_omni.models.nemotron_diarization.model import (
-            NemotronDiarizationModel,
-        )
-
-        checkpoint = resolve_nemo_checkpoint(model_path)
-        validate_checkpoint(checkpoint)
-        self.device = torch.device(device)
-        with torch.device("meta"):
-            self.model = NemotronDiarizationModel(profile=_PROFILES[profile])
-        weights = load_checkpoint_weights(checkpoint)
-        # note (Richard Wang): The activity head only trains an auxiliary loss.
-        for name in [name for name in weights if ".activity_head." in name]:
-            weights.pop(name)
-        for name, tensor in self.model.state_dict().items():
-            if name in weights:
-                weights[name] = weights[name].to(dtype=tensor.dtype).contiguous()
-        self.model.load_state_dict(weights, strict=True, assign=True)
-        del weights
-        self.model.to(device=self.device).eval()
-
-    @torch.inference_mode()
-    def probabilities(self, waveform: np.ndarray) -> torch.Tensor:
-        signal = torch.as_tensor(waveform, dtype=torch.float32, device=self.device)
-        return self.model(signal.unsqueeze(0))
-
-    @torch.inference_mode()
-    def diarize(self, waveform: np.ndarray) -> DiarizationResult:
-        predictions = self.probabilities(waveform)[0].cpu().numpy()
-        return probabilities_to_segments(
-            predictions, duration=len(waveform) / SAMPLE_RATE
-        )
+        else:
+            pass
 
 
 def load_checkpoint_weights(path: Path) -> dict[str, torch.Tensor]:
     """Read tensors without extracting paths or executing pickle globals."""
     with open(path, "rb") as raw, tarfile.open(fileobj=raw) as archive:
         members = [
-            m
-            for m in archive.getmembers()
-            if m.name in {"model_weights.ckpt", "./model_weights.ckpt"}
+            member
+            for member in archive.getmembers()
+            if member.name in {"model_weights.ckpt", "./model_weights.ckpt"}
         ]
         if len(members) != 1 or not members[0].isfile() or members[0].size > 1024**3:
             raise ValueError("Expected one model_weights.ckpt in the .nemo archive")
+        else:
+            pass
         with archive.extractfile(members[0]) as handle:
             # Compressed streams need buffering to avoid repeated decompression.
             source = handle if archive.fileobj is raw else io.BytesIO(handle.read())
             weights = torch.load(source, map_location="cpu", weights_only=True)
     if not isinstance(weights, dict) or not all(
-        isinstance(k, str) and isinstance(v, torch.Tensor) for k, v in weights.items()
+        isinstance(name, str) and isinstance(tensor, torch.Tensor)
+        for name, tensor in weights.items()
     ):
         raise ValueError("Expected a tensor state dictionary in model_weights.ckpt")
+    else:
+        pass
     return weights
+
+
+def load_diarization_model(
+    model_path: str, *, device: torch.device, profile: str
+) -> NemotronDiarizationModel:
+    if profile not in PROFILES:
+        raise ValueError(
+            f"Unknown diarization profile {profile!r}, use one of {list(PROFILES)}"
+        )
+    elif device.type != "cuda":
+        raise ValueError("Nemotron 3 diarization requires an NVIDIA CUDA device")
+    else:
+        pass
+    checkpoint = resolve_nemo_checkpoint(model_path)
+    validate_checkpoint(checkpoint)
+    with torch.device("meta"):
+        model = NemotronDiarizationModel(profile=PROFILES[profile])
+    parameters = model.state_dict()
+    # note (Richard Wang): Restore BF16 or FP32 archives into the FP32 modules.
+    # The activity head only trains an auxiliary loss.
+    weights = {
+        name: (
+            tensor.to(parameters[name].dtype).contiguous()
+            if name in parameters
+            else tensor
+        )
+        for name, tensor in load_checkpoint_weights(checkpoint).items()
+        if ".activity_head." not in name
+    }
+    model.load_state_dict(weights, strict=True, assign=True)
+    return model.to(device).eval()
 
 
 def probabilities_to_segments(
@@ -230,8 +226,9 @@ def probabilities_to_segments(
         or not np.isfinite(predictions).all()
     ):
         raise RuntimeError("Invalid diarization probabilities")
-    if active is None:
-        active = np.zeros(8, dtype=bool)
+    else:
+        pass
+    active = np.zeros(8, dtype=bool) if active is None else active
     positions = np.arange(1, len(predictions) + 1)
     segments = []
     for speaker in range(8):
@@ -239,22 +236,23 @@ def probabilities_to_segments(
         events = np.where(values != 0.5, positions, 0)
         last_event = np.maximum.accumulate(events)
         activity = np.concatenate(([active[speaker]], values > 0.5))[last_event]
-        if len(activity):
-            active[speaker] = activity[-1]
+        active[speaker] = activity[-1] if len(activity) else active[speaker]
         changes = np.diff(np.pad(activity.astype(np.int8), (1, 1)))
         starts, ends = np.flatnonzero(changes == 1), np.flatnonzero(changes == -1)
         for start, end in zip(starts, ends):
-            start, end = (start_frame + int(start)) / 100, (
-                start_frame + int(end)
-            ) / 100
+            start = (start_frame + int(start)) / 100
+            end = (start_frame + int(end)) / 100
             if end > duration + 0.01:
                 raise RuntimeError("Diarization segment extends past the audio")
-            end = min(end, duration)
-            if start < end:
+            elif start < min(end, duration):
                 segments.append(
                     DiarizationSegment(
-                        start=start, end=end, speaker=f"speaker_{speaker}"
+                        start=start,
+                        end=min(end, duration),
+                        speaker=f"speaker_{speaker}",
                     )
                 )
+            else:
+                pass
     segments.sort(key=lambda segment: (segment.start, segment.end, segment.speaker))
     return DiarizationResult(duration=duration, segments=segments)

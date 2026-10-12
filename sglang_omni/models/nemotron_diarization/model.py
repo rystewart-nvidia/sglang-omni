@@ -23,11 +23,12 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from sglang_omni.models.nemotron_diarization.speaker_cache import SpeakerCache
 
 # Use the compiler's deterministic reduction policy without changing other models.
-_compiled_attention = torch.compile(
+compiled_flex_attention = torch.compile(
     flex_attention,
     dynamic=True,
     options={"deterministic": True, "triton.autotune_pointwise": False},
 )
+MASK_BLOCK_FRAMES = 128
 
 
 class Featurizer(nn.Module):
@@ -38,8 +39,8 @@ class Featurizer(nn.Module):
         self.register_buffer("window", torch.empty(400))
         self.register_buffer("fb", torch.empty(1, 128, 257))
 
-    def forward(self, waveform):
-        length = waveform.shape[1] // 160
+    def forward(self, waveform: torch.Tensor) -> tuple[torch.Tensor, int]:
+        frame_count = waveform.shape[1] // 160
         emphasized = torch.cat(
             [waveform[:, :1], waveform[:, 1:] - 0.97 * waveform[:, :-1]], dim=1
         )
@@ -56,8 +57,8 @@ class Featurizer(nn.Module):
         # Preserve the reference's sqrt/square rounding.
         magnitude = torch.sqrt(torch.view_as_real(spectrum).pow(2).sum(-1))
         features = torch.log(torch.matmul(self.fb, magnitude.pow(2)) + 2**-24)
-        features[:, :, length:] = 0
-        return features, length
+        features[:, :, frame_count:] = 0
+        return features, frame_count
 
 
 class Preprocessor(nn.Module):
@@ -65,7 +66,7 @@ class Preprocessor(nn.Module):
         super().__init__()
         self.featurizer = Featurizer()
 
-    def forward(self, waveform):
+    def forward(self, waveform: torch.Tensor) -> tuple[torch.Tensor, int]:
         return self.featurizer(waveform)
 
 
@@ -74,7 +75,7 @@ class FeatureStacking(nn.Module):
         super().__init__()
         self.proj = nn.Linear(8 * 128, 512, bias=False)
 
-    def forward(self, features):
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
         x = features.transpose(1, 2)
         x = F.pad(x, (0, 0, 0, -x.shape[1] % 8))
         return self.proj(x.reshape(1, -1, 8 * 128))
@@ -120,44 +121,6 @@ def rotary_kernel(
     tl.store(k_out + out_base + column, k_value * c + (sign * k_other) * s, valid)
 
 
-def apply_rotary(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply NeOX rotation with separate FP32 products and addition."""
-    batch, heads, frames, head_dim = q.shape
-    if not q.is_cuda:
-        return tuple(
-            x * cos
-            + torch.cat([-x[..., head_dim // 2 :], x[..., : head_dim // 2]], dim=-1)
-            * sin
-            for x in (q, k)
-        )
-    else:
-        q_out, k_out = (
-            torch.empty(
-                (batch, frames, heads, head_dim), device=q.device, dtype=q.dtype
-            ).transpose(1, 2)
-            for _ in range(2)
-        )
-        with torch.cuda.device(q.device):
-            # note (Richard Wang): Fusion changes the FP32 reference rounding.
-            rotary_kernel[(frames, heads, batch)](
-                q,
-                k,
-                cos,
-                sin,
-                q_out,
-                k_out,
-                *q.stride()[:3],
-                *k.stride()[:3],
-                *q_out.stride()[:3],
-                head_dim,
-                triton.next_power_of_2(head_dim),
-                enable_fp_fusion=False,
-            )
-        return q_out, k_out
-
-
 class RotaryEmbedding(nn.Module):
     def __init__(self, max_frames: int):
         super().__init__()
@@ -176,9 +139,33 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
-    def forward(self, q, k):
-        cos, sin = self.cos[: q.shape[2]], self.sin[: q.shape[2]]
-        return apply_rotary(q, k, cos, sin)
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply NeOX rotation with separate FP32 products and addition."""
+        batch, heads, frames, head_dim = q.shape
+        # The kernel reads table rows by frame without a bound check.
+        assert frames <= len(self.cos), f"{frames} frames exceed the rotary table"
+        size = (batch, heads, frames, head_dim)
+        stride = (frames * heads * head_dim, head_dim, heads * head_dim, 1)
+        q_out, k_out = (q.new_empty_strided(size, stride) for _ in range(2))
+        with torch.cuda.device(q.device):
+            # note (Richard Wang): Fusion changes the FP32 reference rounding.
+            rotary_kernel[(frames, heads, batch)](
+                q,
+                k,
+                self.cos,
+                self.sin,
+                q_out,
+                k_out,
+                *q.stride()[:3],
+                *k.stride()[:3],
+                *q_out.stride()[:3],
+                head_dim,
+                triton.next_power_of_2(head_dim),
+                enable_fp_fusion=False,
+            )
+        return q_out, k_out
 
 
 class Attention(nn.Module):
@@ -187,19 +174,18 @@ class Attention(nn.Module):
         self.w_qkv = nn.Linear(512, 1536, bias=False)
         self.out_proj = nn.Linear(512, 512)
 
-    def forward(self, x, rotary, mask):
+    def forward(
+        self, x: torch.Tensor, rotary: RotaryEmbedding, mask: BlockMask
+    ) -> torch.Tensor:
         qkv = self.w_qkv(x).view(1, x.shape[1], 3, 8, 64).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = rotary(q, k)
-        attention = _compiled_attention if x.is_cuda else flex_attention
-        if not x.is_cuda:
-            kernel_options = None
-        elif x.shape[1] < 128:
-            # Keep short-window padding independent of the first compiled length.
-            kernel_options = {"BLOCK_M": 16}
-        else:
-            kernel_options = None
-        out = attention(q, k, v, block_mask=mask, kernel_options=kernel_options)
+        # A window shorter than one mask block uses the smallest query tile, so
+        # its kernel does not depend on the first compiled length.
+        kernel_options = {"BLOCK_M": 16} if x.shape[1] < MASK_BLOCK_FRAMES else None
+        out = compiled_flex_attention(
+            q, k, v, block_mask=mask, kernel_options=kernel_options
+        )
         return self.out_proj(out.transpose(1, 2).contiguous().view(1, x.shape[1], 512))
 
 
@@ -211,7 +197,7 @@ class FeedForward(nn.Module):
             nn.Linear(512, 2048), nn.GELU(), nn.Identity(), nn.Linear(2048, 512)
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
 
@@ -223,9 +209,21 @@ class TransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(512)
         self.ffn = FeedForward()
 
-    def forward(self, x, rotary, mask):
+    def forward(
+        self, x: torch.Tensor, rotary: RotaryEmbedding, mask: BlockMask
+    ) -> torch.Tensor:
         x = x + self.attn(self.norm1(x), rotary, mask)
         return x + self.ffn(self.norm2(x))
+
+
+def block_mask_rows(blocks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the per-row block counts and the block indices that come first."""
+    return (
+        blocks.sum(-1).to(torch.int32)[None, None],
+        blocks.to(torch.int32)
+        .argsort(descending=True, stable=True)
+        .to(torch.int32)[None, None],
+    )
 
 
 class TransformerEncoder(nn.Module):
@@ -236,62 +234,53 @@ class TransformerEncoder(nn.Module):
         self.embed_norm = nn.LayerNorm(512)
         self.layers = nn.ModuleList([TransformerBlock() for _ in range(31)])
         self.final_norm = nn.LayerNorm(512)
-        self._mask_cache = local()
+        # Each worker thread keeps one stream, so its masks stay on that stream.
+        self.thread_masks = local()
 
-    def attention_mask(self, embeddings, valid_length):
-        device = embeddings.device
-        stream = (
-            torch.cuda.current_stream(device).cuda_stream
-            if embeddings.is_cuda
-            else None
-        )
-        key = (embeddings.shape[1], valid_length, device, stream)
-        cache = getattr(self._mask_cache, "entries", None)
-        if cache is None:
-            cache = self._mask_cache.entries = OrderedDict()
-        if key in cache:
-            cache.move_to_end(key)
-            return cache[key]
-        lengths = torch.tensor([valid_length], device=embeddings.device)
+    def attention_mask(self, frame_count: int, valid_length: int) -> BlockMask:
+        masks = getattr(self.thread_masks, "masks", None)
+        if masks is None:
+            masks = self.thread_masks.masks = OrderedDict()
+        else:
+            pass
+        key = (frame_count, valid_length)
+        if key in masks:
+            masks.move_to_end(key)
+            return masks[key]
+        else:
+            pass
+        device = self.final_norm.weight.device
+        lengths = torch.tensor([valid_length], device=device)
 
         def padding_mask(b, h, q_idx, kv_idx):
             return kv_idx < lengths[b]
 
-        size = embeddings.shape[1]
         # note (Richard Wang): Derive prefix blocks without a dense token mask.
-        block_size = 128
-        blocks = torch.arange((size + block_size - 1) // block_size, device="cpu")
-        full = ((blocks[:, None] + 1) * block_size <= size) & (
-            (blocks[None, :] + 1) * block_size <= valid_length
+        blocks = torch.arange(-(-frame_count // MASK_BLOCK_FRAMES), device="cpu")
+        full = ((blocks[:, None] + 1) * MASK_BLOCK_FRAMES <= frame_count) & (
+            (blocks[None, :] + 1) * MASK_BLOCK_FRAMES <= valid_length
         )
-        partial = (blocks[None, :] * block_size < valid_length) & ~full
-        mask = BlockMask.from_kv_blocks(
-            partial.sum(-1).to(torch.int32)[None, None],
-            partial.to(torch.int32)
-            .argsort(descending=True, stable=True)
-            .to(torch.int32)[None, None],
-            full.sum(-1).to(torch.int32)[None, None],
-            full.to(torch.int32)
-            .argsort(descending=True, stable=True)
-            .to(torch.int32)[None, None],
-            BLOCK_SIZE=block_size,
+        partial = (blocks[None, :] * MASK_BLOCK_FRAMES < valid_length) & ~full
+        masks[key] = BlockMask.from_kv_blocks(
+            *block_mask_rows(partial),
+            *block_mask_rows(full),
+            BLOCK_SIZE=MASK_BLOCK_FRAMES,
             mask_mod=padding_mask,
-            seq_lengths=(size, size),
+            seq_lengths=(frame_count, frame_count),
             compute_q_blocks=False,
         ).to(device)
-        # Keep immutable mask metadata on its creation stream.
-        cache[key] = mask
-        if len(cache) > 128:
-            cache.popitem(last=False)
-        return mask
+        if len(masks) > 128:
+            masks.popitem(last=False)
+        else:
+            pass
+        return masks[key]
 
-    def forward(self, embeddings, valid_length, tail=None):
-        mask = self.attention_mask(embeddings, valid_length)
+    def forward(self, embeddings: torch.Tensor, valid_length: int) -> torch.Tensor:
+        mask = self.attention_mask(embeddings.shape[1], valid_length)
         x = self.embed_norm(embeddings)
         for layer in self.layers:
             x = layer(x, self.pos_enc, mask)
-        encoded = self.final_norm(x)
-        return encoded if tail is None else tail(encoded)
+        return self.final_norm(x)
 
 
 class SortformerModules(nn.Module):
@@ -306,7 +295,7 @@ class SortformerModules(nn.Module):
         self.subpixel_upsample = nn.Conv1d(192, 192 * 8, 3, padding=1)
         self.learnable_sil_emb = nn.Parameter(torch.empty(512))
 
-    def forward(self, embeddings, valid_length):
+    def forward(self, embeddings: torch.Tensor, valid_length: int) -> torch.Tensor:
         hidden = self.encoder_proj(embeddings)
         hidden = self.subpixel_upsample(hidden.transpose(1, 2)).transpose(1, 2)
         hidden = hidden.reshape(1, -1, 192)
@@ -326,21 +315,13 @@ class NemotronDiarizationModel(nn.Module):
         self.sortformer_modules = SortformerModules()
         self.profile = profile
 
-    @torch.inference_mode()
-    def forward(self, waveform):
-        """Return [1, time, 8] probabilities at 10 ms, with fresh state per call."""
-        return torch.cat([output for output, _ in self.iter_chunks(waveform)], dim=1)
-
     def iter_chunks(
         self, waveform: torch.Tensor
     ) -> Generator[tuple[torch.Tensor, bool], None, None]:
-        """Yield each upload window's probabilities and whether it is the last."""
-        features, length = self.preprocessor(waveform)
+        """Yield each upload window's 10 ms probabilities and whether it is the last."""
+        features, frame_count = self.preprocessor(waveform)
         del waveform
-        features = features[:, :, :length]
-        if length == 0:
-            yield features.new_empty(1, 0, 8), True
-            return
+        features = features[:, :, :frame_count]
         cache_size, fifo_size, chunk_size, right_context, update_period = self.profile
         state = SpeakerCache(
             features,
@@ -348,34 +329,38 @@ class NemotronDiarizationModel(nn.Module):
             fifo_size=fifo_size,
             update_period=update_period,
         )
-        for start in range(0, length, chunk_size * 8):
-            # A cooperative request can resume on another settled worker stream.
+        if frame_count == 0:
+            yield features.new_empty(1, 0, 8), True
+        else:
+            pass
+        for start in range(0, frame_count, chunk_size * 8):
             if features.is_cuda:
+                # A cooperative request can resume on another settled worker stream.
                 stream = torch.cuda.current_stream(features.device)
                 for tensor in (features, state.cache, state.fifo, state.cache_preds):
                     tensor.record_stream(stream)
-            end = min(start + chunk_size * 8, length)
-            right = min(right_context * 8, length - end)
+            else:
+                pass
+            end = min(start + chunk_size * 8, frame_count)
+            right = min(right_context * 8, frame_count - end)
             yield (
                 self.forward_chunk(features[:, :, start : end + right], state, right)[
                     :, : end - start
                 ],
-                end == length,
+                end == frame_count,
             )
 
-    def forward_chunk(self, features, state: SpeakerCache, right: int):
-        """Advance one recording's cache; right context is in 10 ms frames."""
+    def forward_chunk(
+        self, features: torch.Tensor, state: SpeakerCache, right: int
+    ) -> torch.Tensor:
+        """Advance one recording's cache, with right context in 10 ms frames."""
         chunk = self.encoder.pre_encode(features)
         prefix_length = state.cache.shape[1] + state.fifo.shape[1]
         embeddings = torch.cat([state.cache, state.fifo, chunk], dim=1)
         valid_length = prefix_length + (features.shape[2] + 7) // 8
-
-        def head(encoded):
-            predictions = self.sortformer_modules(encoded, valid_length)
-            pooled = F.avg_pool1d(predictions.transpose(1, 2), 8, 8)
-            return predictions, pooled.transpose(1, 2)
-
-        predictions, low_resolution = self.encoder(embeddings, valid_length, head)
+        encoded = self.encoder(embeddings, valid_length)
+        predictions = self.sortformer_modules(encoded, valid_length)
+        low_resolution = F.avg_pool1d(predictions.transpose(1, 2), 8, 8).transpose(1, 2)
         count = chunk.shape[1] - (right + 7) // 8
         output = predictions[:, prefix_length * 8 : (prefix_length + count) * 8]
         state.update(

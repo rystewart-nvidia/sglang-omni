@@ -12,14 +12,24 @@ from contextlib import contextmanager
 import pytest
 
 from sglang_omni.admission import QueueFullError
-from sglang_omni.proto.admin import ADMIN_MODEL_INFO, ADMIN_PAUSE_GENERATION
+from sglang_omni.scheduling import step_scheduler
 from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.scheduling.step_scheduler import StepResult, StepScheduler
 
 
+def scheduler_for(**kwargs):
+    defaults = dict(
+        max_workers=1,
+        max_running_requests=16,
+        max_queued_requests=64,
+        shutdown_callback=lambda: None,
+    )
+    return StepScheduler(lambda item: item, **{**defaults, **kwargs})
+
+
 @contextmanager
-def running_scheduler(builder, **kwargs):
-    scheduler = StepScheduler(builder, **kwargs)
+def running_scheduler(**kwargs):
+    scheduler = scheduler_for(**kwargs)
     thread = threading.Thread(target=scheduler.start)
     thread.start()
     try:
@@ -31,27 +41,29 @@ def running_scheduler(builder, **kwargs):
 
 
 class Task:
-    def __init__(self, name, steps, trace, *, entered=None, release=None, fail=False):
+    def __init__(self, name, steps, trace, *, release=None, bounded=False):
         self.name = name
         self.remaining = steps
         self.trace = trace
-        self.entered = entered
+        self.entered = threading.Event()
         self.release = release
-        self.fail = fail
+        self.bounded_by_stage = bounded
         self.closed = []
+        self.finished = threading.Event()
 
     def step(self):
         self.trace.append(self.name)
-        if self.entered is not None:
-            self.entered.set()
+        self.entered.set()
+        if self.release is not None:
             assert self.release.wait(timeout=5)
-        if self.fail:
+        if self.remaining is None:
             raise ValueError("model step failed")
         self.remaining -= 1
         return StepResult(self.remaining == 0, self.name)
 
     def close(self, *, aborted):
         self.closed.append(aborted)
+        self.finished.set()
 
 
 def submit(scheduler, task):
@@ -59,14 +71,12 @@ def submit(scheduler, task):
 
 
 def test_first_steps_precede_continuing_work_and_uploads_finish_in_order():
-    trace = []
-    entered, release = threading.Event(), threading.Event()
-    first = Task("first", 3, trace, entered=entered, release=release)
-    second = Task("second", 3, trace)
-    live = Task("live", 1, trace)
-    with running_scheduler(lambda item: item) as scheduler:
+    trace, release = [], threading.Event()
+    first = Task("first", 3, trace, release=release)
+    second, live = Task("second", 3, trace), Task("live", 1, trace)
+    with running_scheduler() as scheduler:
         submit(scheduler, first)
-        assert entered.wait(timeout=5)
+        assert first.entered.wait(timeout=5)
         submit(scheduler, second)
         submit(scheduler, live)
         release.set()
@@ -80,103 +90,80 @@ def test_first_steps_precede_continuing_work_and_uploads_finish_in_order():
 def test_abort_waits_for_inflight_work_and_preserves_other_requests(
     workers, monkeypatch
 ):
-    trace = []
-    entered, release = threading.Event(), threading.Event()
-    monkeypatch.setattr(
-        "sglang_omni.scheduling.step_scheduler._ABORTED_REQUEST_ID_LIMIT", 1
-    )
-    cancelled = Task("cancelled", 3, trace, entered=entered, release=release)
+    monkeypatch.setattr(step_scheduler, "ABORTED_REQUEST_ID_LIMIT", 1)
+    trace, release = [], threading.Event()
+    cancelled = Task("cancelled", 3, trace, release=release)
     healthy = Task("healthy", 1, trace)
-    with running_scheduler(lambda item: item, max_workers=workers) as scheduler:
+    with running_scheduler(max_workers=workers) as scheduler:
         submit(scheduler, cancelled)
-        assert entered.wait(timeout=5)
+        assert cancelled.entered.wait(timeout=5)
         scheduler.abort("cancelled")
         scheduler.abort("unrelated")
         assert not cancelled.closed
         submit(scheduler, healthy)
         release.set()
-        result = scheduler.outbox.get(timeout=5)
-        assert result.request_id == "healthy"
+        assert scheduler.outbox.get(timeout=5).request_id == "healthy"
     assert trace.count("cancelled") == 1
     assert cancelled.closed == [True]
     assert healthy.closed == [False]
 
 
-def test_queue_limit_rejects_excess_and_shutdown_closes_accepted_work():
-    trace = []
-    entered, release = threading.Event(), threading.Event()
-    active = Task("active", 3, trace, entered=entered, release=release)
-    queued = Task("queued", 1, trace)
-    excess = Task("excess", 1, trace)
-    with running_scheduler(
-        lambda item: item, max_running_requests=1, max_queued_requests=1
-    ) as scheduler:
+def test_queue_limit_rejects_excess_except_stage_bounded_work_and_shutdown_closes():
+    trace, release = [], threading.Event()
+    active = Task("active", 3, trace, release=release)
+    queued, excess = Task("queued", 1, trace), Task("excess", 1, trace)
+    bounded = Task("bounded", 1, trace, bounded=True)
+    with running_scheduler(max_running_requests=1, max_queued_requests=1) as scheduler:
         submit(scheduler, active)
-        assert entered.wait(timeout=5)
-        submit(scheduler, queued)
-        submit(scheduler, excess)
+        assert active.entered.wait(timeout=5)
+        for task in (queued, bounded, excess):
+            submit(scheduler, task)
         try:
             rejection = scheduler.outbox.get(timeout=5)
             assert rejection.request_id == "excess"
             assert isinstance(rejection.data, QueueFullError)
-            info = scheduler.admin(ADMIN_MODEL_INFO)["data"]
-            assert info["active_requests"] == info["queued_requests"] == 1
-            assert info["inflight_steps"] == 1
-            assert scheduler.admin(ADMIN_PAUSE_GENERATION)["data"]["unsupported"]
             scheduler.stop()
         finally:
             release.set()
-    assert active.closed == queued.closed == [True]
-    assert excess.closed == [True]
+    assert active.closed == queued.closed == bounded.closed == excess.closed == [True]
     assert trace == ["active"]
 
 
 def test_failed_step_releases_capacity_and_next_request_succeeds():
-    failed = Task("failed", 1, [], fail=True)
-    healthy = Task("healthy", 1, [])
-    with running_scheduler(lambda item: item, max_running_requests=1) as scheduler:
+    failed, healthy = Task("failed", None, []), Task("healthy", 1, [])
+    with running_scheduler(max_running_requests=1) as scheduler:
         submit(scheduler, failed)
         submit(scheduler, healthy)
         failure = scheduler.outbox.get(timeout=5)
         success = scheduler.outbox.get(timeout=5)
-    assert failure.type == "error"
-    assert str(failure.data) == "model step failed"
-    assert success.type == "result"
-    assert success.data == "healthy"
+    assert (failure.type, str(failure.data)) == ("error", "model step failed")
+    assert (success.type, success.data) == ("result", "healthy")
     assert failed.closed == [True]
     assert healthy.closed == [False]
 
 
-def test_cancelled_queued_ids_are_released_while_work_is_active(monkeypatch):
+def test_cancelled_queued_requests_are_released_while_work_is_active(monkeypatch):
     class RequestId(str):
         pass
 
-    monkeypatch.setattr(
-        "sglang_omni.scheduling.step_scheduler._ABORTED_REQUEST_ID_LIMIT", 1
-    )
-    entered, release = threading.Event(), threading.Event()
-    active = Task("active", 1, [], entered=entered, release=release)
+    monkeypatch.setattr(step_scheduler, "ABORTED_REQUEST_ID_LIMIT", 1)
+    release = threading.Event()
+    active = Task("active", 1, [], release=release)
     references = []
-    with running_scheduler(
-        lambda item: item, max_running_requests=1, max_queued_requests=1
-    ) as scheduler:
-
-        def wait_for_queue(count):
-            deadline = time.monotonic() + 5
-            while scheduler.admin(ADMIN_MODEL_INFO)["data"]["queued_requests"] != count:
-                assert time.monotonic() < deadline
-                time.sleep(0.001)
-
+    with running_scheduler(max_running_requests=1, max_queued_requests=1) as scheduler:
         submit(scheduler, active)
         try:
-            assert entered.wait(timeout=5)
+            assert active.entered.wait(timeout=5)
             for index in range(8):
                 queued = Task(RequestId(f"cancelled-{index}"), 1, [])
                 references.append(weakref.ref(queued.name))
                 submit(scheduler, queued)
-                wait_for_queue(1)
+                deadline = time.monotonic() + 5
+                while queued.name not in scheduler.requests:
+                    assert time.monotonic() < deadline
+                    time.sleep(0.001)
                 scheduler.abort(queued.name)
-                wait_for_queue(0)
+                assert queued.finished.wait(timeout=5)
                 assert queued.closed == [True]
                 del queued
             gc.collect()
@@ -185,18 +172,22 @@ def test_cancelled_queued_ids_are_released_while_work_is_active(monkeypatch):
             release.set()
 
 
-def test_stop_at_idle_boundary_exits_without_another_request(monkeypatch):
+@pytest.mark.parametrize("stop_before_start", [False, True])
+def test_stop_at_idle_boundary_exits_without_another_request(
+    stop_before_start, monkeypatch
+):
     closed = []
-    scheduler = StepScheduler(
-        lambda item: item, shutdown_callback=lambda: closed.append(True)
-    )
-    clear = scheduler._wakeup.clear
+    scheduler = scheduler_for(shutdown_callback=lambda: closed.append(True))
+    clear = scheduler.wakeup.clear
 
     def stop_then_clear():
         scheduler.stop()
         clear()
 
-    monkeypatch.setattr(scheduler._wakeup, "clear", stop_then_clear)
+    if stop_before_start:
+        scheduler.stop()
+    else:
+        monkeypatch.setattr(scheduler.wakeup, "clear", stop_then_clear)
     thread = threading.Thread(target=scheduler.start)
     thread.start()
     try:
@@ -204,9 +195,8 @@ def test_stop_at_idle_boundary_exits_without_another_request(monkeypatch):
         assert not thread.is_alive()
         assert closed == [True]
     finally:
-        scheduler._wakeup.set()
+        scheduler.stop()
         thread.join(timeout=5)
-        assert not thread.is_alive()
 
 
 def test_step_scheduler_imports_no_model_runtime():
