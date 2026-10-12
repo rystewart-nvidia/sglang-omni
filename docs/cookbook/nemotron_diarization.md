@@ -180,34 +180,6 @@ samples, so timestamps remain aligned with the audio you sent.
 - Disconnecting a client discards pending results and releases its live session.
   An inference call already in progress finishes before its worker starts more work.
 
-## Benchmarks
-
-Start the server with the local checkpoint configuration above, then select `--task diarize` in the audio benchmark entry points. The default task remains transcription for existing ASR models.
-
-```bash
-python -m benchmarks.eval.benchmark_asr_transcribe_diarize \
-    --task diarize --dataset movies800times --use-existing-server \
-    --model-path /path/to/Nemotron-3-Diarization-preview.nemo \
-    --max-concurrency 16 --output-dir results/nemotron_movies
-```
-
-Movies800Time, AISHELL4 and GoogleTime require authorized access to their private datasets. Use `--dataset aishell4_long` or `--dataset googletime` for the other labeled corpora. Pin the dataset with `--dataset-revision`. Diarization mode reports overlap-aware DER, speaker-count accuracy, and speaker-count MAE from reference speaker timestamps. DER excludes zero seconds on each side of reference boundaries by default. Set `--der-collar` to change that radius. Empty predictions and failed requests count as misses. These corpora and scoring settings differ from the model card and do not reproduce its published values.
-
-```bash
-python -m benchmarks.eval.benchmark_asr_stt_benchmark \
-    --task diarize --port 8000 \
-    --model-path /path/to/Nemotron-3-Diarization-preview.nemo \
-    --concurrencies 1,4,16 --repeats 3 --warmup
-python -m benchmarks.eval.benchmark_asr_seedtts \
-    --task diarize --port 8000 \
-    --model-path /path/to/Nemotron-3-Diarization-preview.nemo \
-    --lang en --concurrencies 1,4,16 --repeats 3 --warmup
-```
-
-STT and SeedTTS have no reference speaker intervals in these loaders, so their diarization mode measures latency and audio throughput only. WER and CER are unavailable for this model. Use `--save-raw-dir` to retain individual SeedTTS or STT requests.
-
-Add `--stream` to replay 100 ms PCM16 packets through the live WebSocket endpoint. The client waits for each acknowledgement and sends without real-time pacing. This measures replay throughput and response latency. It does not measure microphone-to-speaker latency. For 16 simultaneous streams, configure `--diarization.factory.max_live_sessions 16` on the server.
-
 ## Tests
 
 Run the CPU tests for checkpoint validation, timestamp handling, and the endpoint:
