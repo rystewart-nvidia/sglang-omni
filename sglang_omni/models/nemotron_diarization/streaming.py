@@ -106,13 +106,18 @@ class LiveDiarization:
     def append(self, pcm: bytes, *, final: bool = False) -> DiarizationResult:
         start_frame = self.frame
         audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768
-        predictions = self.probabilities(audio, final=final)[0].cpu().numpy()
-        return probabilities_to_segments(
-            predictions,
-            duration=self.samples / SAMPLE_RATE if final else self.frame / 100,
-            start_frame=start_frame,
-            active=self.active,
-        )
+        predictions = self.probabilities(audio, final=final)[0]
+        duration = self.samples / SAMPLE_RATE if final else self.frame / 100
+        if predictions.shape[0] == 0:
+            # Most messages complete no window, so skip the copy and decoding.
+            return DiarizationResult(duration=duration, segments=[])
+        else:
+            return probabilities_to_segments(
+                predictions.cpu().numpy(),
+                duration=duration,
+                start_frame=start_frame,
+                active=self.active,
+            )
 
 
 class LiveSessions:
