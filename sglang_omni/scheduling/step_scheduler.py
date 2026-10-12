@@ -31,7 +31,7 @@ from sglang_omni.profiler.event_recorder import (
     emit_model_path_start as _emit_model_path_start,
 )
 from sglang_omni.proto.admin import ADMIN_MODEL_INFO
-from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +127,9 @@ class StepScheduler:
         # dropped instead of admitted.
         self._aborted_request_ids: set[str] = set()
         self._aborted_request_id_order: deque[str] = deque()
+
+    def warm_up_serving_thread(self) -> None:
+        pass
 
     def start(self) -> None:
         """Run the cooperative loop on the calling thread until ``stop``."""

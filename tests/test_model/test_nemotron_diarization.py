@@ -262,7 +262,7 @@ def test_concurrent_stage_reuses_bounded_workers_and_cuda_streams(
     from sglang_omni.client import Client, GenerateRequest
     from sglang_omni.models.nemotron_diarization import stages
     from sglang_omni.proto import StagePayload
-    from sglang_omni.scheduling.messages import IncomingMessage
+    from sglang_omni.scheduling.message import IncomingMessage
 
     _, native, _ = reference_models
     barrier = threading.Barrier(2, timeout=30)

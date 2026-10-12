@@ -8,7 +8,6 @@ from sglang_omni.config import FactoryArgs, PipelineConfig, StageConfig
 
 class NemotronDiarizationPipelineConfig(PipelineConfig):
     architecture: ClassVar[str] = "SortformerEncLabelModel"
-    requires_model_capabilities: ClassVar[bool] = True
 
     stages: list[StageConfig] = [
         StageConfig(

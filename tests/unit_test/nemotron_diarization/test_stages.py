@@ -18,7 +18,7 @@ from sglang_omni.models.nemotron_diarization import stages
 from sglang_omni.models.nemotron_diarization.backend import NemotronDiarizer
 from sglang_omni.models.nemotron_diarization.model import NemotronDiarizationModel
 from sglang_omni.proto import StagePayload
-from sglang_omni.scheduling.messages import IncomingMessage
+from sglang_omni.scheduling.message import IncomingMessage
 
 
 @pytest.fixture
@@ -26,7 +26,9 @@ def cuda_platform(monkeypatch):
     import sglang_omni.platforms as platforms
 
     monkeypatch.setattr(
-        platforms, "current_platform", SimpleNamespace(device_type="cuda")
+        platforms,
+        "current_platform",
+        SimpleNamespace(device_type="cuda", supports_torchaudio_resample=lambda: True),
     )
 
 

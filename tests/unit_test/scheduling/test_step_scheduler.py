@@ -13,7 +13,7 @@ import pytest
 
 from sglang_omni.admission import QueueFullError
 from sglang_omni.proto.admin import ADMIN_MODEL_INFO, ADMIN_PAUSE_GENERATION
-from sglang_omni.scheduling.messages import IncomingMessage
+from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.scheduling.step_scheduler import StepResult, StepScheduler
 
 
