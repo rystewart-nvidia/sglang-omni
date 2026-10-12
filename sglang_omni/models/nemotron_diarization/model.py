@@ -180,11 +180,13 @@ class Attention(nn.Module):
         qkv = self.w_qkv(x).view(1, x.shape[1], 3, 8, 64).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = rotary(q, k)
-        # A window shorter than one mask block uses the smallest query tile, so
-        # its kernel does not depend on the first compiled length.
-        kernel_options = {"BLOCK_M": 16} if x.shape[1] < MASK_BLOCK_FRAMES else None
+        # note (Richard Wang): A window shorter than one mask block uses the
+        # smallest query tile, so its kernel does not depend on the first compiled
+        # length. Longer windows use a 64-row tile, which doubles the programs of
+        # a one-recording call and keeps the default tile's FP32 summation order.
+        block_rows = 16 if x.shape[1] < MASK_BLOCK_FRAMES else 64
         out = compiled_flex_attention(
-            q, k, v, block_mask=mask, kernel_options=kernel_options
+            q, k, v, block_mask=mask, kernel_options={"BLOCK_M": block_rows}
         )
         return self.out_proj(out.transpose(1, 2).contiguous().view(1, x.shape[1], 512))
 
