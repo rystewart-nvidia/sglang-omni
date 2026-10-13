@@ -148,7 +148,16 @@ class LiveSessions:
     def reserve(self, session_id: str) -> bool:
         """Pin accepted activity, returning whether it continues an idle session."""
         with self.lock:
-            self.expire_idle_sessions()
+            state = self.sessions.get(session_id)
+            if (
+                state is not None
+                and session_id not in self.pending
+                and not state.lock.locked()
+                and time.monotonic() - state.last_used > SESSION_IDLE_SECONDS
+            ):
+                self.sessions.pop(session_id)
+            else:
+                pass
             continues = session_id in self.sessions and session_id not in self.pending
             self.pending[session_id] = self.pending.get(session_id, 0) + 1
             return continues

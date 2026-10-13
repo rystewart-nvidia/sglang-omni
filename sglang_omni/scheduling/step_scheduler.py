@@ -188,13 +188,9 @@ class StepScheduler:
                 self.outbox.put(OutgoingMessage(request_id, "error", data=exc))
                 continue
             self.requests[request_id] = StepRequest(task)
-            limited = sum(
+            if not task.bounded_by_stage and sum(
                 not request.task.bounded_by_stage for request in self.requests.values()
-            )
-            if (
-                not task.bounded_by_stage
-                and limited > self.max_running_requests + self.max_queued_requests
-            ):
+            ) > (self.max_running_requests + self.max_queued_requests):
                 # A rejected live operation may own session state, so close it.
                 self.finish_request(request_id, error=QueueFullError())
             else:
@@ -230,19 +226,22 @@ class StepScheduler:
                 self.active.add(request_id)
         running = sum(request.future is not None for request in self.requests.values())
         while running < self.max_workers:
-            ready = [
-                request_id
-                for request_id, request in self.requests.items()
-                if request_id in self.active and request.future is None
-            ]
-            if not ready:
+            # A newly active request runs its first step before others continue.
+            request_id = None
+            for candidate, request in self.requests.items():
+                if candidate not in self.active or request.future is not None:
+                    continue
+                elif not request.started:
+                    request_id = candidate
+                    break
+                elif request_id is None:
+                    request_id = candidate
+                else:
+                    pass
+            if request_id is None:
                 return
             else:
                 pass
-            # A newly active request runs its first step before others continue.
-            request_id = next(
-                (item for item in ready if not self.requests[item].started), ready[0]
-            )
             request = self.requests[request_id]
             request.started = True
             request.future = executor.submit(request.task.step)

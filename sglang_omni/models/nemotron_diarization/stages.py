@@ -31,17 +31,17 @@ class DiarizationTask:
 
     def __init__(self, worker: DiarizationWorker, payload: StagePayload):
         task = payload.request.metadata.get("task")
-        unsupported = sorted(
+        unsupported = [
             name
             for name, value in payload.request.params.items()
             if name not in worker.default_params or value != worker.default_params[name]
-        )
+        ]
         if task not in ("diarization", "diarization_stream"):
             raise ValueError(
                 "This model accepts requests through /v1/audio/diarizations"
             )
         elif unsupported:
-            raise ValueError(f"Unsupported diarization controls: {unsupported}")
+            raise ValueError(f"Unsupported diarization controls: {sorted(unsupported)}")
         else:
             pass
         self.worker = worker
