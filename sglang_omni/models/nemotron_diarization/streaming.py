@@ -45,6 +45,7 @@ class LiveDiarization:
             fifo_size=fifo_size,
             update_period=update_period,
         )
+        self.no_frames = torch.empty(1, 0, 8, device=device)
         self.lock = threading.Lock()
         self.last_used = time.monotonic()
         self.finished = False
@@ -97,11 +98,7 @@ class LiveDiarization:
             self.buffer_start = keep_from
         self.finished = final
         self.audio = np.empty(0, dtype=np.float32) if final else self.audio
-        return (
-            torch.cat(outputs, dim=1)
-            if outputs
-            else torch.empty(1, 0, 8, device=self.device)
-        )
+        return torch.cat(outputs, dim=1) if outputs else self.no_frames
 
     def append(self, pcm: bytes, *, final: bool = False) -> DiarizationResult:
         start_frame = self.frame

@@ -63,17 +63,19 @@ class DiarizationTask:
                 if self.live
                 else self.upload_step()
             )
-        if result is None:
-            return StepResult()
-        else:
-            return StepResult(
-                done=True,
-                output=StagePayload(
-                    request_id=self.payload.request_id,
-                    request=self.payload.request,
-                    data={"diarization": msgspec.to_builtins(result)},
-                ),
-            )
+            # Finish the result before the exit synchronize hands the GIL to
+            # other stage threads, which would otherwise delay it.
+            if result is None:
+                return StepResult()
+            else:
+                return StepResult(
+                    done=True,
+                    output=StagePayload(
+                        request_id=self.payload.request_id,
+                        request=self.payload.request,
+                        data={"diarization": msgspec.to_builtins(result)},
+                    ),
+                )
 
     def upload_step(self) -> DiarizationResult | None:
         if self.windows is None:
