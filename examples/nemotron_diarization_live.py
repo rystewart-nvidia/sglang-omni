@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Send a laptop microphone or PCM16 WAV to the live diarization endpoint.
 
-Microphone: pip install websockets sounddevice
-File replay: pip install websockets
+Install the client dependencies with pip install websockets sounddevice.
 """
 
 import argparse
@@ -11,106 +10,154 @@ import json
 import queue
 import time
 import wave
+from typing import Literal, Protocol
 
-from websockets import connect
+import numpy as np
+import sounddevice
+from websockets import ClientConnection, connect
+
+SAMPLE_RATE = 16000
+BLOCK_FRAMES = 1600
+# note (Ryan Stewart): Allow brief network or first-inference stalls, while
+# bounding latency.
+MAX_QUEUED_BLOCKS = 50
+# note (Ryan Stewart): Catch up after a slow acknowledgment without paying
+# another network round trip for every 100 ms block. The server accepts at most
+# 1 second.
+MAX_BLOCKS_PER_MESSAGE = 10
+MAX_EVENT_BYTES = 1024 * 1024
+IDLE_POLL_S = 0.01
 
 
-async def receive_until_ack(websocket):
+class StreamTime(Protocol):
+    """PortAudio timestamps that sounddevice passes to an input callback."""
+
+    inputBufferAdcTime: float  # noqa: N815 - PortAudio spelling
+    currentTime: float  # noqa: N815 - PortAudio spelling
+
+
+async def receive_until(
+    websocket: ClientConnection, expected: Literal["audio.ack", "diarization.done"]
+) -> float:
+    """Print speaker updates until the expected event, then return its time in seconds."""
     while True:
         event = json.loads(await websocket.recv())
         if event["type"] == "error":
             raise RuntimeError(event["message"])
-        if event["type"] == "diarization.update":
+        elif event["type"] == "diarization.update":
             for segment in event["segments"]:
                 print(
-                    f'{segment["start"]:8.2f}–{segment["end"]:8.2f}s '
+                    f'{segment["start"]:8.2f} to {segment["end"]:8.2f} s '
                     f'{segment["speaker"]}',
                     flush=True,
                 )
-        if event["type"] in {"audio.ack", "diarization.done"}:
-            return event
+        elif event["type"] == expected:
+            return float(
+                event["processed_until" if expected == "audio.ack" else "duration"]
+            )
+        else:
+            pass
 
 
-async def replay(websocket, path):
+async def replay(websocket: ClientConnection, path: str) -> None:
     with wave.open(path, "rb") as source:
         if (source.getnchannels(), source.getframerate(), source.getsampwidth()) != (
             1,
-            16000,
+            SAMPLE_RATE,
             2,
         ):
             raise ValueError("Use a mono, 16 kHz PCM16 WAV file")
-        start = time.monotonic()
-        sent = 0
-        while audio := source.readframes(1600):
+        else:
+            pass
+        started = time.monotonic()
+        sent_samples = 0
+        while audio := source.readframes(BLOCK_FRAMES):
             await websocket.send(audio)
-            await receive_until_ack(websocket)
-            sent += len(audio) // 2
-            await asyncio.sleep(max(0, start + sent / 16000 - time.monotonic()))
+            await receive_until(websocket, "audio.ack")
+            sent_samples += len(audio) // 2
+            await asyncio.sleep(
+                max(0, started + sent_samples / SAMPLE_RATE - time.monotonic())
+            )
 
 
-async def microphone(websocket, seconds):
-    import sounddevice as sd
+async def microphone(websocket: ClientConnection, duration_s: float) -> None:
+    audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=MAX_QUEUED_BLOCKS)
+    failures: list[str] = []
 
-    # Allow brief network or first-inference stalls, while bounding latency.
-    audio_queue = queue.Queue(maxsize=50)
-    failure = []
-
-    async def send_buffered():
+    async def send_buffered() -> bool:
         audio = bytearray()
-        # Catch up after a slow acknowledgment without paying another network
-        # round trip for every 100 ms block. The server accepts at most 1 second.
-        for _ in range(10):
+        for _ in range(MAX_BLOCKS_PER_MESSAGE):
             try:
                 audio.extend(audio_queue.get_nowait())
             except queue.Empty:
                 break
         if not audio:
             return False
-        await websocket.send(bytes(audio))
-        await receive_until_ack(websocket)
-        return True
+        else:
+            await websocket.send(bytes(audio))
+            await receive_until(websocket, "audio.ack")
+            return True
 
-    def capture(data, frames, timing, status):
-        del frames, timing
+    def capture(
+        input_audio: np.ndarray,
+        frame_count: int,
+        stream_time: StreamTime,
+        status: sounddevice.CallbackFlags,
+    ) -> None:
+        """Queue one block. sounddevice also passes the frame count and timestamps."""
         if status:
-            failure.append(str(status))
-            raise sd.CallbackAbort
+            failures.append(str(status))
+            raise sounddevice.CallbackAbort
+        else:
+            pass
         try:
-            audio_queue.put_nowait(bytes(data))
+            audio_queue.put_nowait(input_audio.tobytes())
         except queue.Full:
-            failure.append(
-                "Connection or server cannot keep up; microphone buffer reached 5 seconds"
+            failures.append(
+                "Connection or server cannot keep up, the microphone buffer "
+                "reached 5 seconds"
             )
-            raise sd.CallbackAbort
+            raise sounddevice.CallbackAbort from None
 
-    print(f"Recording for {seconds:g} seconds. Speak near your microphone.", flush=True)
-    stop_at = time.monotonic() + seconds
-    with sd.RawInputStream(
-        samplerate=16000, channels=1, dtype="int16", blocksize=1600, callback=capture
+    print(
+        f"Recording for {duration_s:g} seconds. Speak near your microphone.",
+        flush=True,
+    )
+    stop_at = time.monotonic() + duration_s
+    with sounddevice.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=1,
+        dtype="int16",
+        blocksize=BLOCK_FRAMES,
+        callback=capture,
     ):
         while time.monotonic() < stop_at:
-            if failure:
-                raise RuntimeError(failure[0])
-            if not await send_buffered():
-                await asyncio.sleep(0.01)
-    if failure:
-        raise RuntimeError(failure[0])
+            if failures:
+                raise RuntimeError(failures[0])
+            elif not await send_buffered():
+                await asyncio.sleep(IDLE_POLL_S)
+            else:
+                pass
+    if failures:
+        raise RuntimeError(failures[0])
+    else:
+        pass
     while not audio_queue.empty():
         await send_buffered()
 
 
-async def main(args):
-    async with connect(args.url, max_size=1024 * 1024) as websocket:
+async def main(arguments: argparse.Namespace) -> None:
+    async with connect(arguments.url, max_size=MAX_EVENT_BYTES) as websocket:
         event = json.loads(await websocket.recv())
         if event["type"] != "session.ready":
             raise RuntimeError(event)
-        if args.file:
-            await replay(websocket, args.file)
+        elif arguments.file:
+            await replay(websocket, arguments.file)
         else:
-            await microphone(websocket, args.seconds)
+            await microphone(websocket, arguments.seconds)
         await websocket.send(json.dumps({"type": "audio.end"}))
-        done = await receive_until_ack(websocket)
-        print(f'Finished: {done["duration"]:.2f} seconds', flush=True)
+        duration_s = await receive_until(websocket, "diarization.done")
+        print(f"Finished: {duration_s:.2f} seconds", flush=True)
 
 
 if __name__ == "__main__":
@@ -124,7 +171,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--seconds", type=float, default=30, help="Microphone recording duration"
     )
-    args = parser.parse_args()
-    if args.seconds <= 0:
+    arguments = parser.parse_args()
+    if arguments.seconds <= 0:
         parser.error("--seconds must be positive")
-    asyncio.run(main(args))
+    else:
+        pass
+    asyncio.run(main(arguments))

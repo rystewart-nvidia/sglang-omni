@@ -9,7 +9,7 @@ import msgspec
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
 from fastapi.responses import JSONResponse
 
-from sglang_omni.client import GenerateRequest
+from sglang_omni.client.types import GenerateRequest
 from sglang_omni.serve.diarization_ws import DiarizationSession
 from sglang_omni.serve.speech_to_text import (
     complete_speech_to_text_request,

@@ -6,7 +6,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 import msgspec
 
@@ -35,10 +35,13 @@ class DiarizationSegment(msgspec.Struct, frozen=True):
 
 
 class DiarizationResult(msgspec.Struct, frozen=True):
-    """Standalone speaker activity; overlapping intervals are permitted."""
+    """Standalone speaker activity, with overlapping intervals permitted."""
 
     duration: float
     segments: list[DiarizationSegment]
+
+
+DiarizationOperation = Literal["open", "append", "finish", "close", "reset"]
 
 
 @dataclass

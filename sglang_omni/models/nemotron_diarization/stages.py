@@ -14,6 +14,7 @@ import torch
 from sglang_omni.client.types import DiarizationResult, SamplingParams
 from sglang_omni.models.nemotron_diarization.backend import (
     SAMPLE_RATE,
+    DiarizationProfile,
     load_diarization_model,
     probabilities_to_segments,
 )
@@ -29,7 +30,7 @@ from sglang_omni.utils.device import resolve_concrete_device
 class DiarizationTask:
     """Advance one recording by one model window, or run one live operation."""
 
-    def __init__(self, worker: DiarizationWorker, payload: StagePayload):
+    def __init__(self, worker: DiarizationWorker, payload: StagePayload) -> None:
         task = payload.request.metadata.get("task")
         unsupported = [
             name
@@ -50,7 +51,8 @@ class DiarizationTask:
         self.windows: Generator[tuple[torch.Tensor, bool], None, None] | None = None
         self.probabilities: list[np.ndarray] = []
         self.duration_s = 0.0
-        # max_live_sessions already bounds the operations of open sessions.
+        # note (Richard Wang): max_live_sessions already bounds the operations
+        # of open sessions.
         self.bounded_by_stage = self.live and worker.live_sessions.reserve(
             payload.request.inputs["session_id"]
         )
@@ -63,8 +65,8 @@ class DiarizationTask:
                 if self.live
                 else self.upload_step()
             )
-            # Finish the result before the exit synchronize hands the GIL to
-            # other stage threads, which would otherwise delay it.
+            # note (Richard Wang): Finish the result before the exit synchronize
+            # hands the GIL to other stage threads, which would otherwise delay it.
             if result is None:
                 return StepResult()
             else:
@@ -85,8 +87,10 @@ class DiarizationTask:
                     source_name="diarization",
                     target_sample_rate=SAMPLE_RATE,
                 )
-            except AudioDecodeError as exc:
-                raise ValueError("could not decode the uploaded audio") from exc
+            except AudioDecodeError as decode_error:
+                raise ValueError(
+                    "could not decode the uploaded audio"
+                ) from decode_error
             if (
                 waveform.ndim != 1
                 or waveform.size == 0
@@ -109,7 +113,7 @@ class DiarizationTask:
         self.probabilities.append(predictions[0].cpu().numpy())
         if done:
             return probabilities_to_segments(
-                np.concatenate(self.probabilities), duration=self.duration_s
+                np.concatenate(self.probabilities), duration_s=self.duration_s
             )
         else:
             return None
@@ -134,12 +138,13 @@ class DiarizationWorker:
         device: torch.device,
         max_concurrency: int,
         max_live_sessions: int,
-    ):
+    ) -> None:
         self.model = model
         self.device = device
         self.live_sessions = LiveSessions(model, device, max_live_sessions)
         if max_concurrency > 1:
-            # Reuse each thread's stream: cuBLAS keeps workspaces per thread/stream pair.
+            # note (Richard Wang): Reuse each thread's stream, because cuBLAS keeps
+            # workspaces per thread and stream pair.
             self.thread_streams = local()
             self.loaded = torch.cuda.Event()
             self.loaded.record(torch.cuda.current_stream(device))
@@ -175,11 +180,11 @@ def create_diarization_executor(
     *,
     device: str | None = None,
     gpu_id: int | None = None,
-    profile: str = "offline",
-    max_concurrency: int = 1,
-    max_live_sessions: int = 8,
-    max_running_requests: int = 16,
-    max_queued_requests: int = 64,
+    profile: DiarizationProfile,
+    max_concurrency: int,
+    max_live_sessions: int,
+    max_running_requests: int,
+    max_queued_requests: int,
 ) -> StepScheduler:
     for name, value in (
         ("max_concurrency", max_concurrency),

@@ -2,70 +2,97 @@
 """Upload and live diarization endpoints through the real client."""
 
 import asyncio
+from typing import TypedDict
 
 import pytest
 from fastapi.testclient import TestClient
+from httpx import Response
 
-from sglang_omni.client import Client
-from sglang_omni.serve import create_app
+from sglang_omni.client.client import Client
+from sglang_omni.proto.request import OmniRequest
 from sglang_omni.serve.diarization_ws import DiarizationSession
+from sglang_omni.serve.openai_api import create_app
 
 ARCHITECTURE = "Nemotron3DiarizationForAudioFrameClassification"
+ServerEvent = dict[str, str | float | list[dict[str, float | str]]]
+
+
+class DiarizationPayload(TypedDict):
+    duration: float
+    segments: list[dict[str, float | str]]
+
+
+class BackendResult(TypedDict, total=False):
+    diarization: DiarizationPayload
+    text: str
 
 
 class Coordinator:
-    def __init__(self, result=None, stages=("diarization",)):
+    def __init__(
+        self,
+        result: BackendResult | None = None,
+        stages: tuple[str, ...] | list[str] = ("diarization",),
+    ) -> None:
         self.result = result
         self.stages = list(stages)
-        self.requests = []
-        self.sessions = {}
-        self.aborted = []
+        self.requests: list[tuple[str, OmniRequest]] = []
+        self.sessions: dict[str, float] = {}
+        self.aborted: list[str] = []
 
-    def health(self):
+    def health(self) -> dict[str, list[str] | str]:
         return {"stages": self.stages, "entry_stage": "diarization"}
 
-    async def submit(self, request_id, request):
+    async def submit(self, request_id: str, request: OmniRequest) -> BackendResult:
         self.requests.append((request_id, request))
         if self.result is not None:
             return self.result
-        session, operation = request.inputs["session_id"], request.inputs["operation"]
-        duration = 0
-        if operation == "open":
-            self.sessions[session] = 0
-        elif operation == "reset":
-            self.sessions.pop(session, None)
-            self.sessions[request.inputs["next_session_id"]] = 0
-        elif operation == "append":
-            self.sessions[session] += len(request.inputs["pcm"]) / 32000
-            duration = self.sessions[session]
-        elif operation == "finish":
-            duration = self.sessions.pop(session)
         else:
-            self.sessions.pop(session, None)
-        return {"diarization": {"duration": duration, "segments": []}}
+            pass
+        session_id = request.inputs["session_id"]
+        operation = request.inputs["operation"]
+        duration_s = 0.0
+        if operation == "open":
+            self.sessions[session_id] = 0.0
+        elif operation == "reset":
+            self.sessions.pop(session_id, None)
+            self.sessions[request.inputs["next_session_id"]] = 0.0
+        elif operation == "append":
+            self.sessions[session_id] += len(request.inputs["pcm"]) / 32000
+            duration_s = self.sessions[session_id]
+        elif operation == "finish":
+            duration_s = self.sessions.pop(session_id)
+        else:
+            self.sessions.pop(session_id, None)
+        return {"diarization": {"duration": duration_s, "segments": []}}
 
-    async def abort(self, request_id):
+    async def abort(self, request_id: str) -> None:
         self.aborted.append(request_id)
 
-    def operations(self):
+    def operations(self) -> list[str]:
         return [request.inputs["operation"] for _, request in self.requests]
 
 
-def connect(coordinator, architecture=ARCHITECTURE):
+def connect(coordinator: Coordinator, architecture: str = ARCHITECTURE) -> TestClient:
     app = create_app(
         Client(coordinator), model_name="diarizer", architectures=[architecture]
     )
     return TestClient(app)
 
 
-def upload(coordinator, architecture=ARCHITECTURE, **data):
+def upload(
+    coordinator: Coordinator,
+    architecture: str = ARCHITECTURE,
+    form_fields: dict[str, str] | None = None,
+) -> Response:
     return connect(coordinator, architecture).post(
-        "/v1/audio/diarizations", data=data, files={"file": ("test.wav", b"RIFF")}
+        "/v1/audio/diarizations",
+        data=form_fields or {},
+        files={"file": ("test.wav", b"RIFF")},
     )
 
 
-def test_upload_returns_overlapping_intervals_with_request_identity():
-    result = {
+def test_upload_returns_overlapping_intervals_with_request_identity() -> None:
+    result: DiarizationPayload = {
         "duration": 2.0,
         "segments": [
             {"start": 0.0, "end": 1.5, "speaker": "speaker_0"},
@@ -83,7 +110,7 @@ def test_upload_returns_overlapping_intervals_with_request_identity():
 
 
 @pytest.mark.parametrize(
-    "data, status",
+    "form_fields, status",
     [
         ({"stream": "true"}, 400),
         ({"response_format": "text"}, 400),
@@ -91,13 +118,15 @@ def test_upload_returns_overlapping_intervals_with_request_identity():
         ({"model": "unknown"}, 404),
     ],
 )
-def test_unsupported_controls_or_models_are_rejected_before_dispatch(data, status):
+def test_unsupported_controls_or_models_are_rejected_before_dispatch(
+    form_fields: dict[str, str], status: int
+) -> None:
     coordinator = Coordinator({})
-    assert upload(coordinator, **data).status_code == status
+    assert upload(coordinator, form_fields=form_fields).status_code == status
     assert coordinator.requests == []
 
 
-def test_missing_backend_result_is_an_error():
+def test_missing_backend_result_is_an_error() -> None:
     assert upload(Coordinator({"text": ""})).status_code == 500
 
 
@@ -109,41 +138,48 @@ def test_missing_backend_result_is_an_error():
     ],
     ids=["other-architecture", "process-replicas"],
 )
-def test_unsupported_servers_reject_diarization_without_dispatch(architecture, stages):
+def test_unsupported_servers_reject_diarization_without_dispatch(
+    architecture: str, stages: list[str]
+) -> None:
     coordinator = Coordinator(stages=stages)
     with connect(coordinator, architecture) as client:
-        with client.websocket_connect("/v1/audio/diarizations/stream") as ws:
-            assert ws.receive_json()["type"] == "error"
-            assert ws.receive()["code"] == 1008
+        with client.websocket_connect("/v1/audio/diarizations/stream") as websocket:
+            assert websocket.receive_json()["type"] == "error"
+            assert websocket.receive()["code"] == 1008
     if architecture != ARCHITECTURE:
         assert upload(coordinator, architecture).status_code == 400
+    else:
+        pass
     assert coordinator.requests == []
 
 
-def test_live_updates_precede_eof_and_reset_replaces_the_session():
+def test_live_updates_precede_eof_and_reset_replaces_the_session() -> None:
     coordinator = Coordinator()
     with connect(coordinator) as client:
-        with client.websocket_connect("/v1/audio/diarizations/stream") as ws:
-            ready = ws.receive_json()
+        with client.websocket_connect("/v1/audio/diarizations/stream") as websocket:
+            ready = websocket.receive_json()
             assert ready["type"] == "session.ready"
-            ws.send_bytes(b"\0\0" * 8000)
-            assert ws.receive_json() == {
+            websocket.send_bytes(b"\0\0" * 8000)
+            assert websocket.receive_json() == {
                 "type": "diarization.update",
                 "start": 0,
                 "end": 0.5,
                 "segments": [],
             }
-            assert ws.receive_json()["type"] == "audio.ack"
-            ws.send_json({"type": "session.reset"})
-            reset = ws.receive_json()
+            assert websocket.receive_json()["type"] == "audio.ack"
+            websocket.send_json({"type": "session.reset"})
+            reset = websocket.receive_json()
             assert reset["type"] == "session.ready"
             assert reset["session_id"] != ready["session_id"]
-            ws.send_bytes(b"\0\0" * 160)
-            assert ws.receive_json()["start"] == 0
-            assert ws.receive_json()["type"] == "audio.ack"
-            ws.send_json({"type": "audio.end"})
-            assert ws.receive_json() == {"type": "diarization.done", "duration": 0.01}
-            assert ws.receive()["type"] == "websocket.close"
+            websocket.send_bytes(b"\0\0" * 160)
+            assert websocket.receive_json()["start"] == 0
+            assert websocket.receive_json()["type"] == "audio.ack"
+            websocket.send_json({"type": "audio.end"})
+            assert websocket.receive_json() == {
+                "type": "diarization.done",
+                "duration": 0.01,
+            }
+            assert websocket.receive()["type"] == "websocket.close"
     assert coordinator.sessions == {}
     assert coordinator.operations() == [
         "open",
@@ -156,30 +192,36 @@ def test_live_updates_precede_eof_and_reset_replaces_the_session():
 
 
 @pytest.mark.parametrize("invalid", [b"x", b"\0" * 32002, {"type": "unknown"}])
-def test_invalid_messages_close_the_session_without_dispatching_audio(invalid):
+def test_invalid_messages_close_the_session_without_dispatching_audio(
+    invalid: bytes | dict[str, str],
+) -> None:
     coordinator = Coordinator()
     with connect(coordinator) as client:
-        with client.websocket_connect("/v1/audio/diarizations/stream") as ws:
-            assert ws.receive_json()["type"] == "session.ready"
+        with client.websocket_connect("/v1/audio/diarizations/stream") as websocket:
+            assert websocket.receive_json()["type"] == "session.ready"
             if isinstance(invalid, bytes):
-                ws.send_bytes(invalid)
+                websocket.send_bytes(invalid)
             else:
-                ws.send_json(invalid)
-            assert ws.receive_json()["type"] == "error"
-            assert ws.receive()["type"] == "websocket.close"
+                websocket.send_json(invalid)
+            assert websocket.receive_json()["type"] == "error"
+            assert websocket.receive()["type"] == "websocket.close"
     assert coordinator.sessions == {}
     assert coordinator.operations() == ["open", "close"]
 
 
-def test_canceled_admission_settles_before_session_can_be_closed():
-    async def scenario():
+def test_canceled_admission_settles_before_session_can_be_closed() -> None:
+    async def scenario() -> None:
         started, release = asyncio.Event(), asyncio.Event()
 
         class SlowOpen(Coordinator):
-            async def submit(self, request_id, request):
+            async def submit(
+                self, request_id: str, request: OmniRequest
+            ) -> BackendResult:
                 if request.inputs["operation"] == "open":
                     started.set()
                     await release.wait()
+                else:
+                    pass
                 return await super().submit(request_id, request)
 
         coordinator = SlowOpen()
@@ -188,7 +230,8 @@ def test_canceled_admission_settles_before_session_can_be_closed():
         await started.wait()
         pending.cancel()
         await asyncio.sleep(0)
-        assert not pending.done()  # Admission must settle before teardown continues.
+        # note (Ryan Stewart): Admission must settle before teardown continues.
+        assert not pending.done()
         release.set()
         with pytest.raises(asyncio.CancelledError):
             await pending
@@ -199,34 +242,42 @@ def test_canceled_admission_settles_before_session_can_be_closed():
     asyncio.run(scenario())
 
 
-def test_queue_overflow_aborts_pending_work_and_releases_session():
-    async def scenario():
+def test_queue_overflow_aborts_pending_work_and_releases_session() -> None:
+    async def scenario() -> None:
         ready, started = asyncio.Event(), asyncio.Event()
-        outputs = []
+        outputs: list[ServerEvent] = []
 
         class SlowAppend(Coordinator):
-            async def submit(self, request_id, request):
+            async def submit(
+                self, request_id: str, request: OmniRequest
+            ) -> BackendResult:
                 if request.inputs["operation"] == "append":
                     started.set()
                     await asyncio.Event().wait()
+                else:
+                    pass
                 return await super().submit(request_id, request)
 
         class Socket:
-            count = 0
+            receive_count = 0
 
-            async def receive(self):
+            async def receive(self) -> dict[str, str | bytes]:
                 await ready.wait()
-                if self.count:
+                if self.receive_count:
                     await started.wait()
-                self.count += 1
+                else:
+                    pass
+                self.receive_count += 1
                 return {"type": "websocket.receive", "bytes": b"\0\0" * 160}
 
-            async def send_json(self, event):
+            async def send_json(self, event: ServerEvent) -> None:
                 outputs.append(event)
                 if event["type"] == "session.ready":
                     ready.set()
+                else:
+                    pass
 
-            async def close(self):
+            async def close(self) -> None:
                 pass
 
         coordinator = SlowAppend()

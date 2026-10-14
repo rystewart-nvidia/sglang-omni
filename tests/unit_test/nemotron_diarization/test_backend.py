@@ -4,6 +4,7 @@
 import importlib
 import io
 import tarfile
+from pathlib import Path
 
 import msgspec
 import numpy as np
@@ -12,6 +13,7 @@ import torch
 import yaml
 from torch._inductor import config as inductor_config
 
+from sglang_omni.models.nemotron_diarization import model
 from sglang_omni.models.nemotron_diarization.backend import (
     REQUIRED_CONFIG,
     load_checkpoint_weights,
@@ -19,25 +21,28 @@ from sglang_omni.models.nemotron_diarization.backend import (
     resolve_nemo_checkpoint,
     validate_checkpoint,
 )
+from sglang_omni.models.nemotron_diarization.model import TransformerEncoder
 
 
-def write_archive(path, name, data, *, copies=1, symlink=False):
+def write_archive(
+    path: Path, name: str, payload: bytes, *, copies: int = 1, symlink: bool = False
+) -> Path:
     with tarfile.open(path, "w") as archive:
-        info = tarfile.TarInfo(name)
+        member = tarfile.TarInfo(name)
         if symlink:
-            info.type, info.linkname = tarfile.SYMTYPE, "/outside/archive"
+            member.type, member.linkname = tarfile.SYMTYPE, "/outside/archive"
         else:
-            info.size = len(data)
+            member.size = len(payload)
         for _ in range(copies):
-            archive.addfile(info, io.BytesIO(data))
+            archive.addfile(member, io.BytesIO(payload))
     return path
 
 
-def test_segments_preserve_overlap_and_clip_only_the_partial_last_frame():
+def test_segments_preserve_overlap_and_clip_only_the_partial_last_frame() -> None:
     predictions = np.zeros((251, 8))
     predictions[:200, 0] = 1
     predictions[100:, 7] = 1
-    result = probabilities_to_segments(predictions, duration=2.504)
+    result = probabilities_to_segments(predictions, duration_s=2.504)
     assert msgspec.to_builtins(result) == {
         "duration": 2.504,
         "segments": [
@@ -46,15 +51,17 @@ def test_segments_preserve_overlap_and_clip_only_the_partial_last_frame():
         ],
     }
     with pytest.raises(RuntimeError, match="segment extends past the audio"):
-        probabilities_to_segments(np.ones((300, 8)), duration=2.0)
+        probabilities_to_segments(np.ones((300, 8)), duration_s=2.0)
 
 
-def test_threshold_ties_retain_previous_activity_and_preserve_overlap():
+def test_threshold_ties_retain_previous_activity_and_preserve_overlap() -> None:
     predictions = np.zeros((7, 8), dtype=np.float32)
     predictions[:, 0] = [0.5, 0.6, 0.5, 0.4, 0.5, 0.6, 0.5]
     predictions[2:4, 7] = 0.9
-    result = probabilities_to_segments(predictions, duration=0.07)
-    assert [(s.start, s.end, s.speaker) for s in result.segments] == [
+    result = probabilities_to_segments(predictions, duration_s=0.07)
+    assert [
+        (segment.start, segment.end, segment.speaker) for segment in result.segments
+    ] == [
         (0.01, 0.03, "speaker_0"),
         (0.02, 0.04, "speaker_7"),
         (0.05, 0.07, "speaker_0"),
@@ -72,8 +79,10 @@ def test_threshold_ties_retain_previous_activity_and_preserve_overlap():
     ],
 )
 def test_checkpoint_validator_accepts_only_the_released_layout(
-    tmp_path, overrides, accepted
-):
+    tmp_path: Path,
+    overrides: dict[str, bool | dict[str, str | float]],
+    accepted: bool,
+) -> None:
     config = {
         "target": "nemo.collections.asr.models.sortformer_diar_models.SortformerEncLabelModel",
         "sample_rate": 16000,
@@ -81,12 +90,15 @@ def test_checkpoint_validator_accepts_only_the_released_layout(
         "output_subsampling_factor": 1,
         "streaming_mode": True,
         "max_num_of_spks": 8,
-        # The released checkpoint trains an auxiliary activity head.
+        # note (Richard Wang): The released checkpoint trains an auxiliary
+        # activity head.
         "activity_weight": 0.5,
         **{section: dict(values) for section, values in REQUIRED_CONFIG.items()},
     }
-    for key, value in overrides.items():
-        config[key] = {**config[key], **value} if key in REQUIRED_CONFIG else value
+    for field_name, value in overrides.items():
+        config[field_name] = (
+            {**config[field_name], **value} if field_name in REQUIRED_CONFIG else value
+        )
     path = write_archive(
         tmp_path / "test.nemo", "model_config.yaml", yaml.safe_dump(config).encode()
     )
@@ -98,7 +110,9 @@ def test_checkpoint_validator_accepts_only_the_released_layout(
 
 
 @pytest.mark.parametrize("name", ["unrelated.nemo", "missing.nemo"])
-def test_local_paths_never_select_another_archive_or_the_hub(tmp_path, name):
+def test_local_paths_never_select_another_archive_or_the_hub(
+    tmp_path: Path, name: str
+) -> None:
     (tmp_path / "unrelated.nemo").touch()
     target = tmp_path if name == "unrelated.nemo" else tmp_path / name
     with pytest.raises(FileNotFoundError, match="Missing .nemo checkpoint"):
@@ -106,7 +120,9 @@ def test_local_paths_never_select_another_archive_or_the_hub(tmp_path, name):
 
 
 @pytest.mark.parametrize("variant", ["duplicate", "symlink", "non_tensor"])
-def test_weights_must_be_one_regular_tensor_state_dict(tmp_path, variant):
+def test_weights_must_be_one_regular_tensor_state_dict(
+    tmp_path: Path, variant: str
+) -> None:
     serialized = io.BytesIO()
     state = {"weight": torch.zeros(1)}
     torch.save(
@@ -123,9 +139,7 @@ def test_weights_must_be_one_regular_tensor_state_dict(tmp_path, variant):
         load_checkpoint_weights(path)
 
 
-def test_reused_attention_masks_preserve_each_valid_length():
-    from sglang_omni.models.nemotron_diarization.model import TransformerEncoder
-
+def test_reused_attention_masks_preserve_each_valid_length() -> None:
     encoder = TransformerEncoder(max_frames=9)
     positions = torch.arange(9)
     for valid_length in [9, 3, 8, 3, 9]:
@@ -135,9 +149,9 @@ def test_reused_attention_masks_preserve_each_valid_length():
 
 
 @pytest.mark.parametrize("deterministic", [False, True])
-def test_model_compiler_policy_leaves_other_models_unchanged(deterministic):
-    from sglang_omni.models.nemotron_diarization import model
-
+def test_model_compiler_policy_leaves_other_models_unchanged(
+    deterministic: bool,
+) -> None:
     with inductor_config.patch(
         {"deterministic": deterministic, "triton.autotune_pointwise": True}
     ):

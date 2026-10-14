@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import tarfile
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import torch
@@ -17,15 +18,18 @@ from sglang_omni.models.nemotron_diarization.model import NemotronDiarizationMod
 
 CHECKPOINT_FILENAME = "Nemotron-3-Diarization.nemo"
 SAMPLE_RATE = 16000
-PROFILES = {
-    # Cache, FIFO, chunk, right context and update period, in 80 ms frames.
+DiarizationProfile = Literal["offline", "low_latency"]
+PROFILES: dict[DiarizationProfile, tuple[int, int, int, int, int]] = {
+    # note (Ryan Stewart): Cache, FIFO, chunk, right context and update period,
+    # in 80 ms frames.
     "offline": (264, 40, 340, 40, 300),
     "low_latency": (264, 264, 9, 4, 222),
 }
 
-# Native inference implements this published architecture only. In particular,
-# shape-compatible changes to normalization, attention or cache scoring must not
-# silently load with different semantics. Training-only settings are irrelevant.
+# note (Ryan Stewart): Native inference implements this published architecture
+# only. In particular, shape-compatible changes to normalization, attention or
+# cache scoring must not silently load with different semantics. Training-only
+# settings are irrelevant.
 REQUIRED_CONFIG = {
     "preprocessor": {
         "_target_": "nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor",
@@ -112,7 +116,7 @@ def resolve_nemo_checkpoint(model_path: str) -> Path:
 
 
 def validate_checkpoint(path: Path) -> None:
-    # Inspect configuration without instantiating any of its NeMo targets.
+    """Inspect the configuration without instantiating any of its NeMo targets."""
     with tarfile.open(path) as archive:
         configs = [
             member
@@ -145,10 +149,11 @@ def validate_checkpoint(path: Path) -> None:
     for section in REQUIRED_CONFIG:
         values = config[section]
         if any(
-            values.get(key) != value for key, value in REQUIRED_CONFIG[section].items()
+            values.get(field_name) != value
+            for field_name, value in REQUIRED_CONFIG[section].items()
         ) or any(
-            values.get(key, value) != value
-            for key, value in DEFAULT_CONFIG.get(section, {}).items()
+            values.get(field_name, value) != value
+            for field_name, value in DEFAULT_CONFIG.get(section, {}).items()
         ):
             raise ValueError(f"Checkpoint is not the supported {section} configuration")
         else:
@@ -168,7 +173,8 @@ def load_checkpoint_weights(path: Path) -> dict[str, torch.Tensor]:
         else:
             pass
         with archive.extractfile(members[0]) as handle:
-            # Compressed streams need buffering to avoid repeated decompression.
+            # note (Richard Wang): Compressed streams need buffering to avoid
+            # repeated decompression.
             source = handle if archive.fileobj is raw else io.BytesIO(handle.read())
             weights = torch.load(source, map_location="cpu", weights_only=True)
     if not isinstance(weights, dict) or not all(
@@ -182,7 +188,7 @@ def load_checkpoint_weights(path: Path) -> dict[str, torch.Tensor]:
 
 
 def load_diarization_model(
-    model_path: str, *, device: torch.device, profile: str
+    model_path: str, *, device: torch.device, profile: DiarizationProfile
 ) -> NemotronDiarizationModel:
     if profile not in PROFILES:
         raise ValueError(
@@ -215,7 +221,7 @@ def load_diarization_model(
 def probabilities_to_segments(
     predictions: np.ndarray,
     *,
-    duration: float,
+    duration_s: float,
     start_frame: int = 0,
     active: np.ndarray | None = None,
 ) -> DiarizationResult:
@@ -239,20 +245,20 @@ def probabilities_to_segments(
         active[speaker] = activity[-1] if len(activity) else active[speaker]
         changes = np.diff(np.pad(activity.astype(np.int8), (1, 1)))
         starts, ends = np.flatnonzero(changes == 1), np.flatnonzero(changes == -1)
-        for start, end in zip(starts, ends):
-            start = (start_frame + int(start)) / 100
-            end = (start_frame + int(end)) / 100
-            if end > duration + 0.01:
+        for start_frame_offset, end_frame_offset in zip(starts, ends):
+            start_s = (start_frame + int(start_frame_offset)) / 100
+            end_s = (start_frame + int(end_frame_offset)) / 100
+            if end_s > duration_s + 0.01:
                 raise RuntimeError("Diarization segment extends past the audio")
-            elif start < min(end, duration):
+            elif start_s < min(end_s, duration_s):
                 segments.append(
                     DiarizationSegment(
-                        start=start,
-                        end=min(end, duration),
+                        start=start_s,
+                        end=min(end_s, duration_s),
                         speaker=f"speaker_{speaker}",
                     )
                 )
             else:
                 pass
     segments.sort(key=lambda segment: (segment.start, segment.end, segment.speaker))
-    return DiarizationResult(duration=duration, segments=segments)
+    return DiarizationResult(duration=duration_s, segments=segments)

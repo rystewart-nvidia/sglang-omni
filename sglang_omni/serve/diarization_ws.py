@@ -12,7 +12,12 @@ import msgspec
 from fastapi import WebSocket, WebSocketDisconnect
 
 from sglang_omni.admission import QueueFullError
-from sglang_omni.client import Client, DiarizationResult, GenerateRequest
+from sglang_omni.client.client import Client
+from sglang_omni.client.types import (
+    DiarizationOperation,
+    DiarizationResult,
+    GenerateRequest,
+)
 
 logger = logging.getLogger(__name__)
 MAX_AUDIO_BYTES = 32000
@@ -25,7 +30,9 @@ def new_session_id() -> str:
 
 
 class DiarizationSession:
-    def __init__(self, websocket: WebSocket, *, client: Client, model_name: str):
+    def __init__(
+        self, websocket: WebSocket, *, client: Client, model_name: str
+    ) -> None:
         self.websocket = websocket
         self.client = client
         self.model_name = model_name
@@ -44,10 +51,10 @@ class DiarizationSession:
                 task.result()
         except WebSocketDisconnect:
             pass
-        except Exception as exc:
-            logger.warning("Live diarization %s failed: %s", self.session_id, exc)
+        except Exception as error:
+            logger.warning(f"Live diarization {self.session_id} failed: {error}")
             try:
-                await self.websocket.send_json({"type": "error", "message": str(exc)})
+                await self.websocket.send_json({"type": "error", "message": str(error)})
             except (WebSocketDisconnect, RuntimeError):
                 pass
         finally:
@@ -55,14 +62,16 @@ class DiarizationSession:
             worker.cancel()
             await asyncio.gather(receiver, worker, return_exceptions=True)
             try:
-                # A separate close request releases persistent state even if the
-                # active chunk was canceled while physical inference continued.
+                # note (Ryan Stewart): A separate close request releases persistent
+                # state even if the active chunk was canceled while physical
+                # inference continued.
                 await self.request("close")
-            except Exception as exc:
-                # A close that admission rejected has already released the session.
-                if not QueueFullError.matches(exc):
+            except Exception as close_error:
+                # note (Richard Wang): A close that admission rejected has already
+                # released the session.
+                if not QueueFullError.matches(close_error):
                     logger.exception(
-                        "Failed to close diarization session %s", self.session_id
+                        f"Failed to close diarization session {self.session_id}"
                     )
                 else:
                     pass
@@ -105,11 +114,13 @@ class DiarizationSession:
                     "Audio queue is full, wait for audio.ack before sending more"
                 ) from None
 
-    async def request(self, operation: str, pcm: bytes = b"") -> DiarizationResult:
+    async def request(
+        self, operation: DiarizationOperation, pcm: bytes = b""
+    ) -> DiarizationResult:
         prompt = {"session_id": self.session_id, "operation": operation, "pcm": pcm}
         if operation == "reset":
-            # Name the replacement first, so teardown closes it even if this is
-            # canceled.
+            # note (Richard Wang): Name the replacement first, so teardown closes
+            # it even if this is canceled.
             self.session_id = prompt["next_session_id"] = new_session_id()
         else:
             pass
@@ -130,8 +141,8 @@ class DiarizationSession:
             )
         except asyncio.CancelledError:
             if admits_session:
-                # Finish admission before close, so a canceled open or reset
-                # cannot create orphaned state after the close operation ran.
+                # note (Richard Wang): Finish admission before close, so a canceled
+                # open or reset cannot create orphaned state after the close ran.
                 await completion
             else:
                 await self.client.abort(request_id)
@@ -158,17 +169,17 @@ class DiarizationSession:
         await self.request("open")
         await self.ready()
         while True:
-            item = await self.messages.get()
-            if item == "session.reset":
+            queued_message = await self.messages.get()
+            if queued_message == "session.reset":
                 await self.request("reset")
                 self.end_s = 0.0
                 await self.ready()
                 continue
             else:
                 pass
-            final = item == "audio.end"
+            final = queued_message == "audio.end"
             result = await self.request(
-                "finish" if final else "append", b"" if final else item
+                "finish" if final else "append", b"" if final else queued_message
             )
             if result.duration > self.end_s:
                 await self.websocket.send_json(

@@ -86,7 +86,7 @@ python examples/nemotron_diarization_live.py --seconds 30
 python examples/nemotron_diarization_live.py --file live.wav
 ```
 
-Convert other recordings for replay with `ffmpeg -i input.wav -ar 16000 -ac 1 -c:a pcm_s16le live.wav`.
+The client imports sounddevice in both modes, which needs the PortAudio library on Linux (for example `apt install libportaudio2`). Convert other recordings for replay with `ffmpeg -i input.wav -ar 16000 -ac 1 -c:a pcm_s16le live.wav`.
 
 After `session.ready`, send binary messages of mono, 16 kHz, little-endian PCM16 samples without a WAV header, up to one second (32,000 bytes) per message, and wait for `audio.ack` after each one. Send control events as JSON, for example `{"type": "audio.end"}`.
 

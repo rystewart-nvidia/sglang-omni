@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import weakref
+from collections.abc import Iterator
 from contextlib import contextmanager
 
 import pytest
@@ -14,22 +15,41 @@ import pytest
 from sglang_omni.admission import QueueFullError
 from sglang_omni.scheduling import step_scheduler
 from sglang_omni.scheduling.message import IncomingMessage
-from sglang_omni.scheduling.step_scheduler import StepResult, StepScheduler
+from sglang_omni.scheduling.step_scheduler import (
+    ShutdownCallback,
+    StepResult,
+    StepScheduler,
+)
 
 
-def scheduler_for(**kwargs):
-    defaults = dict(
-        max_workers=1,
-        max_running_requests=16,
-        max_queued_requests=64,
-        shutdown_callback=lambda: None,
+def scheduler_for(
+    *,
+    max_workers: int = 1,
+    max_running_requests: int = 16,
+    max_queued_requests: int = 64,
+    shutdown_callback: ShutdownCallback | None = None,
+) -> StepScheduler:
+    return StepScheduler(
+        lambda task: task,
+        max_workers=max_workers,
+        max_running_requests=max_running_requests,
+        max_queued_requests=max_queued_requests,
+        shutdown_callback=shutdown_callback or (lambda: None),
     )
-    return StepScheduler(lambda item: item, **{**defaults, **kwargs})
 
 
 @contextmanager
-def running_scheduler(**kwargs):
-    scheduler = scheduler_for(**kwargs)
+def running_scheduler(
+    *,
+    max_workers: int = 1,
+    max_running_requests: int = 16,
+    max_queued_requests: int = 64,
+) -> Iterator[StepScheduler]:
+    scheduler = scheduler_for(
+        max_workers=max_workers,
+        max_running_requests=max_running_requests,
+        max_queued_requests=max_queued_requests,
+    )
     thread = threading.Thread(target=scheduler.start)
     thread.start()
     try:
@@ -41,36 +61,47 @@ def running_scheduler(**kwargs):
 
 
 class Task:
-    def __init__(self, name, steps, trace, *, release=None, bounded=False):
+    def __init__(
+        self,
+        name: str,
+        steps: int | None,
+        trace: list[str],
+        *,
+        release: threading.Event | None = None,
+        bounded: bool = False,
+    ) -> None:
         self.name = name
         self.remaining = steps
         self.trace = trace
         self.entered = threading.Event()
         self.release = release
         self.bounded_by_stage = bounded
-        self.closed = []
+        self.closed: list[bool] = []
         self.finished = threading.Event()
 
-    def step(self):
+    def step(self) -> StepResult:
         self.trace.append(self.name)
         self.entered.set()
         if self.release is not None:
             assert self.release.wait(timeout=5)
+        else:
+            pass
         if self.remaining is None:
             raise ValueError("model step failed")
-        self.remaining -= 1
-        return StepResult(self.remaining == 0, self.name)
+        else:
+            self.remaining -= 1
+            return StepResult(self.remaining == 0, self.name)
 
-    def close(self, *, aborted):
+    def close(self, *, aborted: bool) -> None:
         self.closed.append(aborted)
         self.finished.set()
 
 
-def submit(scheduler, task):
+def submit(scheduler: StepScheduler, task: Task) -> None:
     scheduler.inbox.put(IncomingMessage(task.name, "new_request", task))
 
 
-def test_first_steps_precede_continuing_work_and_uploads_finish_in_order():
+def test_first_steps_precede_continuing_work_and_uploads_finish_in_order() -> None:
     trace, release = [], threading.Event()
     first = Task("first", 3, trace, release=release)
     second, live = Task("second", 3, trace), Task("live", 1, trace)
@@ -88,8 +119,8 @@ def test_first_steps_precede_continuing_work_and_uploads_finish_in_order():
 
 @pytest.mark.parametrize("workers", [1, 2])
 def test_abort_waits_for_inflight_work_and_preserves_other_requests(
-    workers, monkeypatch
-):
+    workers: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(step_scheduler, "ABORTED_REQUEST_ID_LIMIT", 1)
     trace, release = [], threading.Event()
     cancelled = Task("cancelled", 3, trace, release=release)
@@ -108,7 +139,9 @@ def test_abort_waits_for_inflight_work_and_preserves_other_requests(
     assert healthy.closed == [False]
 
 
-def test_queue_limit_rejects_excess_except_stage_bounded_work_and_shutdown_closes():
+def test_queue_limit_rejects_excess_except_stage_bounded_work_and_shutdown_closes() -> (
+    None
+):
     trace, release = [], threading.Event()
     active = Task("active", 3, trace, release=release)
     queued, excess = Task("queued", 1, trace), Task("excess", 1, trace)
@@ -129,7 +162,7 @@ def test_queue_limit_rejects_excess_except_stage_bounded_work_and_shutdown_close
     assert trace == ["active"]
 
 
-def test_failed_step_releases_capacity_and_next_request_succeeds():
+def test_failed_step_releases_capacity_and_next_request_succeeds() -> None:
     failed, healthy = Task("failed", None, []), Task("healthy", 1, [])
     with running_scheduler(max_running_requests=1) as scheduler:
         submit(scheduler, failed)
@@ -142,7 +175,9 @@ def test_failed_step_releases_capacity_and_next_request_succeeds():
     assert healthy.closed == [False]
 
 
-def test_cancelled_queued_requests_are_released_while_work_is_active(monkeypatch):
+def test_cancelled_queued_requests_are_released_while_work_is_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class RequestId(str):
         pass
 
@@ -174,13 +209,13 @@ def test_cancelled_queued_requests_are_released_while_work_is_active(monkeypatch
 
 @pytest.mark.parametrize("stop_before_start", [False, True])
 def test_stop_at_idle_boundary_exits_without_another_request(
-    stop_before_start, monkeypatch
-):
-    closed = []
+    stop_before_start: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    closed: list[bool] = []
     scheduler = scheduler_for(shutdown_callback=lambda: closed.append(True))
     clear = scheduler.wakeup.clear
 
-    def stop_then_clear():
+    def stop_then_clear() -> None:
         scheduler.stop()
         clear()
 
@@ -199,7 +234,7 @@ def test_stop_at_idle_boundary_exits_without_another_request(
         thread.join(timeout=5)
 
 
-def test_step_scheduler_imports_no_model_runtime():
+def test_step_scheduler_imports_no_model_runtime() -> None:
     """Stages that never allocate KV cache must not pay for the AR runtime."""
     script = (
         "import sys\n"

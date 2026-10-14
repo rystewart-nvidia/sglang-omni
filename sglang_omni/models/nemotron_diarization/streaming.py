@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import threading
 import time
+from typing import get_args
 
 import numpy as np
 import torch
 
-from sglang_omni.client.types import DiarizationResult
+from sglang_omni.client.types import DiarizationOperation, DiarizationResult
 from sglang_omni.models.nemotron_diarization.backend import (
     PROFILES,
     SAMPLE_RATE,
@@ -18,15 +19,18 @@ from sglang_omni.models.nemotron_diarization.backend import (
 from sglang_omni.models.nemotron_diarization.model import NemotronDiarizationModel
 from sglang_omni.models.nemotron_diarization.speaker_cache import SpeakerCache
 
-MAX_AUDIO_BYTES = SAMPLE_RATE * 2  # At most one second of PCM16 per message.
+# note (Ryan Stewart): At most one second of PCM16 per message.
+MAX_AUDIO_BYTES = SAMPLE_RATE * 2
 SESSION_IDLE_SECONDS = 60
-OPERATIONS = ("open", "append", "finish", "close", "reset")
+OPERATIONS: tuple[DiarizationOperation, ...] = get_args(DiarizationOperation)
 
 
 class LiveDiarization:
     """Keep acoustic context and speaker identity without retaining the recording."""
 
-    def __init__(self, model: NemotronDiarizationModel, *, device: torch.device):
+    def __init__(
+        self, model: NemotronDiarizationModel, *, device: torch.device
+    ) -> None:
         self.model = model
         self.device = device
         self.audio = np.empty(0, dtype=np.float32)
@@ -34,7 +38,7 @@ class LiveDiarization:
         self.samples = 0
         self.frame = 0
         self.active = np.zeros(8, dtype=bool)
-        # Live audio uses the published low-latency profile.
+        # note (Richard Wang): Live audio uses the published low-latency profile.
         cache_size, fifo_size, chunk_size, right_context, update_period = PROFILES[
             "low_latency"
         ]
@@ -62,16 +66,20 @@ class LiveDiarization:
         self.samples += len(audio)
         outputs = []
         while self.frame < self.samples // 160:
-            available = self.samples // 160 - self.frame
-            count = min(self.chunk_frames, available)
-            right = min(self.right_frames, available - count)
-            # Centered STFT needs future samples as well as encoder lookahead.
+            available_frames = self.samples // 160 - self.frame
+            window_chunk_frames = min(self.chunk_frames, available_frames)
+            window_right_frames = min(
+                self.right_frames, available_frames - window_chunk_frames
+            )
+            # note (Ryan Stewart): Centered STFT needs future samples as well as
+            # encoder lookahead.
             window_frames = self.chunk_frames + self.right_frames
             if not final and self.samples < (self.frame + window_frames) * 160 + 256:
                 break
             elif self.state.cache.is_cuda:
-                # Successive messages can run on different workers. Keep old
-                # cache storage alive until this stream finishes reading it.
+                # note (Ryan Stewart): Successive messages can run on different
+                # workers. Keep old cache storage alive until this stream finishes
+                # reading it.
                 stream = torch.cuda.current_stream(self.device)
                 for tensor in (
                     self.state.cache,
@@ -81,21 +89,32 @@ class LiveDiarization:
                     tensor.record_stream(stream)
             else:
                 pass
-            offset = (self.frame * 160 - self.buffer_start) // 160
-            end = (offset + count + right) * 160 + 256
+            offset_frames = (self.frame * 160 - self.buffer_start) // 160
+            end_sample = (
+                offset_frames + window_chunk_frames + window_right_frames
+            ) * 160 + 256
             signal = torch.as_tensor(
-                self.audio[:end], device=self.device, dtype=torch.float32
+                self.audio[:end_sample], device=self.device, dtype=torch.float32
             )[None, :]
             features, _ = self.model.preprocessor(signal)
-            features = features[:, :, offset : offset + count + right]
+            features = features[
+                :,
+                :,
+                offset_frames : offset_frames
+                + window_chunk_frames
+                + window_right_frames,
+            ]
             outputs.append(
-                self.model.forward_chunk(features, self.state, right)[:, :count]
+                self.model.forward_chunk(features, self.state, window_right_frames)[
+                    :, :window_chunk_frames
+                ]
             )
-            self.frame += count
-            # Two hop lengths preserve the STFT window and preemphasis history.
-            keep_from = max(0, self.frame * 160 - 320)
-            self.audio = self.audio[keep_from - self.buffer_start :].copy()
-            self.buffer_start = keep_from
+            self.frame += window_chunk_frames
+            # note (Ryan Stewart): Two hop lengths preserve the STFT window and
+            # preemphasis history.
+            keep_from_sample = max(0, self.frame * 160 - 320)
+            self.audio = self.audio[keep_from_sample - self.buffer_start :].copy()
+            self.buffer_start = keep_from_sample
         self.finished = final
         self.audio = np.empty(0, dtype=np.float32) if final else self.audio
         return torch.cat(outputs, dim=1) if outputs else self.no_frames
@@ -104,14 +123,15 @@ class LiveDiarization:
         start_frame = self.frame
         audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768
         predictions = self.probabilities(audio, final=final)[0]
-        duration = self.samples / SAMPLE_RATE if final else self.frame / 100
+        duration_s = self.samples / SAMPLE_RATE if final else self.frame / 100
         if predictions.shape[0] == 0:
-            # Most messages complete no window, so skip the copy and decoding.
-            return DiarizationResult(duration=duration, segments=[])
+            # note (Richard Wang): Most messages complete no window, so skip the
+            # copy and decoding.
+            return DiarizationResult(duration=duration_s, segments=[])
         else:
             return probabilities_to_segments(
                 predictions.cpu().numpy(),
-                duration=duration,
+                duration_s=duration_s,
                 start_frame=start_frame,
                 active=self.active,
             )
@@ -122,7 +142,7 @@ class LiveSessions:
 
     def __init__(
         self, model: NemotronDiarizationModel, device: torch.device, max_sessions: int
-    ):
+    ) -> None:
         self.model = model
         self.device = device
         self.max_sessions = max_sessions
@@ -179,8 +199,8 @@ class LiveSessions:
     def compute(self, inputs: dict[str, str | bytes]) -> DiarizationResult:
         session_id, operation = inputs["session_id"], inputs["operation"]
         pcm = inputs.get("pcm", b"")
-        # A reset replaces the session in one operation, so it never needs a
-        # second session slot.
+        # note (Richard Wang): A reset replaces the session in one operation, so
+        # it never needs a second session slot.
         opened = inputs["next_session_id"] if operation == "reset" else session_id
         if not isinstance(pcm, bytes) or len(pcm) % 2 or len(pcm) > MAX_AUDIO_BYTES:
             raise ValueError("Expected at most one second of mono PCM16 audio")

@@ -15,7 +15,6 @@ from __future__ import annotations
 import logging
 import queue
 import threading
-from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Protocol
@@ -32,7 +31,7 @@ ABORTED_REQUEST_ID_LIMIT = 10000
 class StepInbox(queue.Queue):
     """Wake the scheduler loop when a stage submits work."""
 
-    def __init__(self, wakeup: threading.Event):
+    def __init__(self, wakeup: threading.Event) -> None:
         super().__init__()
         self.wakeup = wakeup
 
@@ -66,6 +65,18 @@ class StepTask(Protocol):
     def close(self, *, aborted: bool) -> None: ...
 
 
+class TaskBuilder(Protocol):
+    """Build the task of one admitted request."""
+
+    def __call__(self, payload: StagePayload) -> StepTask: ...
+
+
+class ShutdownCallback(Protocol):
+    """Release stage resources after the scheduler loop exits."""
+
+    def __call__(self) -> None: ...
+
+
 @dataclass
 class StepRequest:
     task: StepTask
@@ -79,13 +90,13 @@ class StepScheduler:
 
     def __init__(
         self,
-        build_task: Callable[[StagePayload], StepTask],
+        build_task: TaskBuilder,
         *,
         max_workers: int,
         max_running_requests: int,
         max_queued_requests: int,
-        shutdown_callback: Callable[[], None],
-    ):
+        shutdown_callback: ShutdownCallback,
+    ) -> None:
         self.build_task = build_task
         self.max_workers = max_workers
         self.max_running_requests = max_running_requests
@@ -93,14 +104,16 @@ class StepScheduler:
         self.shutdown_callback = shutdown_callback
         self.requests: dict[str, StepRequest] = {}
         self.active: set[str] = set()
-        # Aborts can arrive before admission or after completion. A bounded
-        # window of ids drops a late message for an aborted request.
+        # note (Richard Wang): Aborts can arrive before admission or after
+        # completion. A bounded window of ids drops a late message for an
+        # aborted request.
         self.aborted_request_ids: dict[str, None] = {}
         self.wakeup = threading.Event()
         self.inbox = StepInbox(self.wakeup)
         self.outbox: queue.Queue[OutgoingMessage] = queue.Queue()
         self.lock = threading.Lock()
-        # A stop that arrives before the stage thread calls start must hold.
+        # note (Richard Wang): A stop that arrives before the stage thread calls
+        # start must hold.
         self.running = True
 
     def warm_up_serving_thread(self) -> None:
@@ -109,8 +122,8 @@ class StepScheduler:
     def start(self) -> None:
         """Run the scheduler loop on the calling thread until stop."""
         try:
-            # Leaving the pool waits for in-flight steps, so tasks close only
-            # after their device work settles.
+            # note (Richard Wang): Leaving the pool waits for in-flight steps, so
+            # tasks close only after their device work settles.
             with ThreadPoolExecutor(
                 self.max_workers, thread_name_prefix="omni-step"
             ) as executor:
@@ -161,9 +174,9 @@ class StepScheduler:
         aborted = aborted or request.aborted or request_id in self.aborted_request_ids
         try:
             request.task.close(aborted=aborted or error is not None)
-        except Exception as exc:
-            logger.exception("Step task cleanup failed for %s", request_id)
-            error = error or exc
+        except Exception as close_error:
+            logger.exception(f"Step task cleanup failed for {request_id}")
+            error = error or close_error
         if aborted:
             pass
         elif error is not None:
@@ -184,14 +197,15 @@ class StepScheduler:
                 pass
             try:
                 task = self.build_task(message.data)
-            except Exception as exc:
-                self.outbox.put(OutgoingMessage(request_id, "error", data=exc))
+            except Exception as build_error:
+                self.outbox.put(OutgoingMessage(request_id, "error", data=build_error))
                 continue
             self.requests[request_id] = StepRequest(task)
             if not task.bounded_by_stage and sum(
                 not request.task.bounded_by_stage for request in self.requests.values()
             ) > (self.max_running_requests + self.max_queued_requests):
-                # A rejected live operation may own session state, so close it.
+                # note (Richard Wang): A rejected live operation may own session
+                # state, so close it.
                 self.finish_request(request_id, error=QueueFullError())
             else:
                 pass
@@ -210,8 +224,8 @@ class StepScheduler:
                 request.future = None
             try:
                 result = future.result()
-            except Exception as exc:
-                self.finish_request(request_id, error=exc)
+            except Exception as step_error:
+                self.finish_request(request_id, error=step_error)
                 continue
             if result.done:
                 self.finish_request(request_id, result=result)
@@ -226,7 +240,8 @@ class StepScheduler:
                 self.active.add(request_id)
         running = sum(request.future is not None for request in self.requests.values())
         while running < self.max_workers:
-            # A newly active request runs its first step before others continue.
+            # note (Richard Wang): A newly active request runs its first step
+            # before others continue.
             request_id = None
             for candidate, request in self.requests.items():
                 if candidate not in self.active or request.future is not None:
