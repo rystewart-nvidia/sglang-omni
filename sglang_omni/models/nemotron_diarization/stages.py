@@ -151,7 +151,6 @@ class DiarizationWorker:
         else:
             self.thread_streams = None
         self.default_params = SamplingParams().to_dict()
-        self.default_params.pop("max_new_tokens")
         self.default_params["stream"] = False
 
     @contextmanager
