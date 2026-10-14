@@ -94,8 +94,7 @@ class SpeakerCache:
                 indices,
                 speakers,
             ] -= boost_scale * math.log(0.5)
-        # note (Ryan Stewart): One silence frame per speaker, followed by
-        # speaker-major ordering.
+        # note (Ryan Stewart): One silence frame per speaker, then speaker-major order.
         scores = torch.cat([scores, scores.new_full((1, 1, 8), float("inf"))], dim=1)
         frame_count = scores.shape[1]
         values, indices = torch.topk(

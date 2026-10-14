@@ -18,8 +18,7 @@ from sglang_omni.models.nemotron_diarization.streaming import (
 
 CHUNK_FRAMES = 72
 WINDOW_FRAMES = 104
-# note (Richard Wang): One low-latency window needs its chunk and lookahead
-# frames plus the centered STFT tail, and the buffer keeps two hop lengths.
+# note (Richard Wang): A window spans chunk, lookahead, and STFT tail, plus two hops of history.
 WINDOW_SAMPLES = WINDOW_FRAMES * 160 + 256
 HISTORY_SAMPLES = 320
 

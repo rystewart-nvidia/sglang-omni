@@ -71,15 +71,12 @@ class LiveDiarization:
             window_right_frames = min(
                 self.right_frames, available_frames - window_chunk_frames
             )
-            # note (Ryan Stewart): Centered STFT needs future samples as well as
-            # encoder lookahead.
+            # note (Ryan Stewart): Centered STFT needs future samples beyond the encoder lookahead.
             window_frames = self.chunk_frames + self.right_frames
             if not final and self.samples < (self.frame + window_frames) * 160 + 256:
                 break
             elif self.state.cache.is_cuda:
-                # note (Ryan Stewart): Successive messages can run on different
-                # workers. Keep old cache storage alive until this stream finishes
-                # reading it.
+                # note (Ryan Stewart): Keep old cache storage alive until this stream has read it.
                 stream = torch.cuda.current_stream(self.device)
                 for tensor in (
                     self.state.cache,
@@ -110,8 +107,7 @@ class LiveDiarization:
                 ]
             )
             self.frame += window_chunk_frames
-            # note (Ryan Stewart): Two hop lengths preserve the STFT window and
-            # preemphasis history.
+            # note (Ryan Stewart): Two hop lengths preserve the STFT window and preemphasis history.
             keep_from_sample = max(0, self.frame * 160 - 320)
             self.audio = self.audio[keep_from_sample - self.buffer_start :].copy()
             self.buffer_start = keep_from_sample
@@ -125,8 +121,7 @@ class LiveDiarization:
         predictions = self.probabilities(audio, final=final)[0]
         duration_s = self.samples / SAMPLE_RATE if final else self.frame / 100
         if predictions.shape[0] == 0:
-            # note (Richard Wang): Most messages complete no window, so skip the
-            # copy and decoding.
+            # note (Richard Wang): Most messages complete no window, so skip decoding.
             return DiarizationResult(duration=duration_s, segments=[])
         else:
             return probabilities_to_segments(
@@ -199,8 +194,7 @@ class LiveSessions:
     def compute(self, inputs: dict[str, str | bytes]) -> DiarizationResult:
         session_id, operation = inputs["session_id"], inputs["operation"]
         pcm = inputs.get("pcm", b"")
-        # note (Richard Wang): A reset replaces the session in one operation, so
-        # it never needs a second session slot.
+        # note (Richard Wang): A reset swaps the session in one operation, without a second slot.
         opened = inputs["next_session_id"] if operation == "reset" else session_id
         if not isinstance(pcm, bytes) or len(pcm) % 2 or len(pcm) > MAX_AUDIO_BYTES:
             raise ValueError("Expected at most one second of mono PCM16 audio")

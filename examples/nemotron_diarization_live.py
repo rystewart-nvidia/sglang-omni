@@ -18,12 +18,9 @@ from websockets import ClientConnection, connect
 
 SAMPLE_RATE = 16000
 BLOCK_FRAMES = 1600
-# note (Ryan Stewart): Allow brief network or first-inference stalls, while
-# bounding latency.
+# note (Ryan Stewart): Ride out brief network or first-inference stalls at bounded latency.
 MAX_QUEUED_BLOCKS = 50
-# note (Ryan Stewart): Catch up after a slow acknowledgment without paying
-# another network round trip for every 100 ms block. The server accepts at most
-# 1 second.
+# note (Ryan Stewart): Catch up after a slow ack in one message, up to the server's 1 second limit.
 MAX_BLOCKS_PER_MESSAGE = 10
 MAX_EVENT_BYTES = 1024 * 1024
 IDLE_POLL_S = 0.01

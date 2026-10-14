@@ -20,16 +20,12 @@ CHECKPOINT_FILENAME = "Nemotron-3-Diarization.nemo"
 SAMPLE_RATE = 16000
 DiarizationProfile = Literal["offline", "low_latency"]
 PROFILES: dict[DiarizationProfile, tuple[int, int, int, int, int]] = {
-    # note (Ryan Stewart): Cache, FIFO, chunk, right context and update period,
-    # in 80 ms frames.
+    # note (Ryan Stewart): Cache, FIFO, chunk, right context, and update period in 80 ms frames.
     "offline": (264, 40, 340, 40, 300),
     "low_latency": (264, 264, 9, 4, 222),
 }
 
-# note (Ryan Stewart): Native inference implements this published architecture
-# only. In particular, shape-compatible changes to normalization, attention or
-# cache scoring must not silently load with different semantics. Training-only
-# settings are irrelevant.
+# note (Ryan Stewart): Shape-compatible variants must not silently load with different semantics.
 REQUIRED_CONFIG = {
     "preprocessor": {
         "_target_": "nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor",
@@ -173,8 +169,7 @@ def load_checkpoint_weights(path: Path) -> dict[str, torch.Tensor]:
         else:
             pass
         with archive.extractfile(members[0]) as handle:
-            # note (Richard Wang): Compressed streams need buffering to avoid
-            # repeated decompression.
+            # note (Richard Wang): Buffer compressed streams to avoid repeated decompression.
             source = handle if archive.fileobj is raw else io.BytesIO(handle.read())
             weights = torch.load(source, map_location="cpu", weights_only=True)
     if not isinstance(weights, dict) or not all(
@@ -203,8 +198,7 @@ def load_diarization_model(
     with torch.device("meta"):
         model = NemotronDiarizationModel(profile=PROFILES[profile])
     parameters = model.state_dict()
-    # note (Richard Wang): Restore BF16 or FP32 archives into the FP32 modules.
-    # The activity head only trains an auxiliary loss.
+    # note (Richard Wang): Load BF16 or FP32 archives as FP32, minus the unused activity head.
     weights = {
         name: (
             tensor.to(parameters[name].dtype).contiguous()

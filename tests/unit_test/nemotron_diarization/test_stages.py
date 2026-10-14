@@ -190,8 +190,7 @@ def test_unsupported_deployments_fail_before_loading(
             max_running_requests=16,
             max_queued_requests=64,
         )
-    # note (Ryan Stewart): A hard-coded cuda:0 would put every stage on the wrong
-    # GPU.
+    # note (Ryan Stewart): A hard-coded cuda:0 would put every stage on the wrong GPU.
     assert devices == [torch.device("cuda:3")]
 
 
@@ -248,8 +247,7 @@ def test_failed_inference_waits_for_gpu_before_propagating_error(
     [
         ("append", {"pcm": b"\0\0" * 160}, {}, ["connected"]),
         ("reset", {"next_session_id": "replacement"}, {}, ["replacement"]),
-        # note (Richard Wang): A pending count stands for an aborted operation
-        # whose step still runs.
+        # note (Richard Wang): A pending count marks an aborted operation whose step still runs.
         ("close", {}, {"connected": 1}, []),
     ],
 )

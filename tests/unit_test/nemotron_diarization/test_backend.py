@@ -90,8 +90,7 @@ def test_checkpoint_validator_accepts_only_the_released_layout(
         "output_subsampling_factor": 1,
         "streaming_mode": True,
         "max_num_of_spks": 8,
-        # note (Richard Wang): The released checkpoint trains an auxiliary
-        # activity head.
+        # note (Richard Wang): The released checkpoint trains an auxiliary activity head.
         "activity_weight": 0.5,
         **{section: dict(values) for section, values in REQUIRED_CONFIG.items()},
     }

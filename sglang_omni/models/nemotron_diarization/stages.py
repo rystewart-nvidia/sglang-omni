@@ -51,8 +51,7 @@ class DiarizationTask:
         self.windows: Generator[tuple[torch.Tensor, bool], None, None] | None = None
         self.probabilities: list[np.ndarray] = []
         self.duration_s = 0.0
-        # note (Richard Wang): max_live_sessions already bounds the operations
-        # of open sessions.
+        # note (Richard Wang): max_live_sessions already bounds the operations of open sessions.
         self.bounded_by_stage = self.live and worker.live_sessions.reserve(
             payload.request.inputs["session_id"]
         )
@@ -65,8 +64,7 @@ class DiarizationTask:
                 if self.live
                 else self.upload_step()
             )
-            # note (Richard Wang): Finish the result before the exit synchronize
-            # hands the GIL to other stage threads, which would otherwise delay it.
+            # note (Richard Wang): Build the result before the exit synchronize yields the GIL.
             if result is None:
                 return StepResult()
             else:
@@ -143,8 +141,7 @@ class DiarizationWorker:
         self.device = device
         self.live_sessions = LiveSessions(model, device, max_live_sessions)
         if max_concurrency > 1:
-            # note (Richard Wang): Reuse each thread's stream, because cuBLAS keeps
-            # workspaces per thread and stream pair.
+            # note (Richard Wang): One stream per thread, matching cuBLAS per-stream workspaces.
             self.thread_streams = local()
             self.loaded = torch.cuda.Event()
             self.loaded.record(torch.cuda.current_stream(device))

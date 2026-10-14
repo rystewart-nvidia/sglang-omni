@@ -8,8 +8,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Literal, TypedDict
 
-import msgspec
-
 
 class TokenUsageDict(TypedDict):
     prompt_tokens: int | None
@@ -26,7 +24,8 @@ class UsageInfoDict(TokenUsageDict, total=False):
 UNKNOWN_FINISH_REASON = "unknown"
 
 
-class DiarizationSegment(msgspec.Struct, frozen=True):
+@dataclass(frozen=True, kw_only=True)
+class DiarizationSegment:
     """One speaker's active interval, in seconds from the recording start."""
 
     start: float
@@ -34,7 +33,8 @@ class DiarizationSegment(msgspec.Struct, frozen=True):
     speaker: str
 
 
-class DiarizationResult(msgspec.Struct, frozen=True):
+@dataclass(frozen=True, kw_only=True)
+class DiarizationResult:
     """Standalone speaker activity, with overlapping intervals permitted."""
 
     duration: float

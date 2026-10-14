@@ -22,8 +22,7 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 from sglang_omni.models.nemotron_diarization.speaker_cache import SpeakerCache
 
-# note (Richard Wang): Use the compiler's deterministic reduction policy without
-# changing other models.
+# note (Richard Wang): Use deterministic compiler reductions without changing other models.
 compiled_flex_attention = torch.compile(
     flex_attention,
     dynamic=True,
@@ -35,9 +34,7 @@ MASK_BLOCK_FRAMES = 128
 class Featurizer(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        # note (Ryan Stewart): These buffers are restored from the checkpoint, like
-        # VoiceChat's mel filters. Diarization uses centered STFT rather than
-        # causal left padding.
+        # note (Ryan Stewart): Restored from the checkpoint, for a centered rather than causal STFT.
         self.register_buffer("window", torch.empty(400))
         self.register_buffer("fb", torch.empty(1, 128, 257))
 
@@ -150,8 +147,7 @@ class RotaryEmbedding(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply NeOX rotation with separate FP32 products and addition."""
         batch, heads, frames, head_dim = q.shape
-        # note (Richard Wang): The kernel reads table rows by frame without a
-        # bound check.
+        # note (Richard Wang): The kernel reads table rows by frame without a bound check.
         assert frames <= len(self.cos), f"{frames} frames exceed the rotary table"
         size = (batch, heads, frames, head_dim)
         stride = (frames * heads * head_dim, head_dim, heads * head_dim, 1)
@@ -191,10 +187,7 @@ class Attention(nn.Module):
         )
         q, k, v = qkv.unbind(0)
         q, k = rotary(q, k)
-        # note (Richard Wang): A window shorter than one mask block uses the
-        # smallest query tile, so its kernel does not depend on the first compiled
-        # length. Longer windows use a 64-row tile, which doubles the programs of
-        # a one-recording call and keeps the default tile's FP32 summation order.
+        # note (Richard Wang): Tile by window length only and keep the 64-row FP32 summation order.
         block_rows = 16 if hidden_states.shape[1] < MASK_BLOCK_FRAMES else 64
         attention_output = compiled_flex_attention(
             q, k, v, block_mask=mask, kernel_options={"BLOCK_M": block_rows}
@@ -209,8 +202,7 @@ class Attention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        # note (Ryan Stewart): Identity occupies the checkpoint's training-dropout
-        # index.
+        # note (Ryan Stewart): Identity holds the checkpoint's training-dropout index.
         self.net = nn.Sequential(
             nn.Linear(512, 2048), nn.GELU(), nn.Identity(), nn.Linear(2048, 512)
         )
@@ -254,8 +246,7 @@ class TransformerEncoder(nn.Module):
         self.embed_norm = nn.LayerNorm(512)
         self.layers = nn.ModuleList([TransformerBlock() for _ in range(31)])
         self.final_norm = nn.LayerNorm(512)
-        # note (Richard Wang): Each worker thread keeps one stream, so its masks
-        # stay on that stream.
+        # note (Richard Wang): Per-thread masks stay on that worker thread's stream.
         self.thread_masks = local()
 
     def attention_mask(self, frame_count: int, valid_length: int) -> BlockMask:
@@ -312,8 +303,7 @@ class TransformerEncoder(nn.Module):
 class SortformerModules(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        # note (Ryan Stewart): Retained for strict loading, this legacy head is
-        # stored in the archive but is unused by the high-resolution forward path.
+        # note (Ryan Stewart): Unused legacy head that strict loading needs from the archive.
         self.hidden_to_spks = nn.Linear(384, 8)
         self.first_hidden_to_hidden = nn.Linear(192, 192)
         self.single_hidden_to_spks = nn.Linear(192, 8)
@@ -361,8 +351,7 @@ class NemotronDiarizationModel(nn.Module):
             pass
         for start_frame in range(0, frame_count, chunk_size * 8):
             if features.is_cuda:
-                # note (Richard Wang): A cooperative request can resume on another
-                # settled worker stream.
+                # note (Richard Wang): The next window may run on another worker stream.
                 stream = torch.cuda.current_stream(features.device)
                 for tensor in (features, state.cache, state.fifo, state.cache_preds):
                     tensor.record_stream(stream)

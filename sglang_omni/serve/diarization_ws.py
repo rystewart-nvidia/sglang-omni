@@ -62,13 +62,10 @@ class DiarizationSession:
             worker.cancel()
             await asyncio.gather(receiver, worker, return_exceptions=True)
             try:
-                # note (Ryan Stewart): A separate close request releases persistent
-                # state even if the active chunk was canceled while physical
-                # inference continued.
+                # note (Ryan Stewart): Close frees state even if a canceled chunk still infers.
                 await self.request("close")
             except Exception as close_error:
-                # note (Richard Wang): A close that admission rejected has already
-                # released the session.
+                # note (Richard Wang): A close that admission rejected already released the session.
                 if not QueueFullError.matches(close_error):
                     logger.exception(
                         f"Failed to close diarization session {self.session_id}"
@@ -119,8 +116,7 @@ class DiarizationSession:
     ) -> DiarizationResult:
         prompt = {"session_id": self.session_id, "operation": operation, "pcm": pcm}
         if operation == "reset":
-            # note (Richard Wang): Name the replacement first, so teardown closes
-            # it even if this is canceled.
+            # note (Richard Wang): Name the replacement first, so teardown closes it if canceled.
             self.session_id = prompt["next_session_id"] = new_session_id()
         else:
             pass
@@ -141,8 +137,7 @@ class DiarizationSession:
             )
         except asyncio.CancelledError:
             if admits_session:
-                # note (Richard Wang): Finish admission before close, so a canceled
-                # open or reset cannot create orphaned state after the close ran.
+                # note (Richard Wang): Finish admission first, so a canceled open orphans no state.
                 await completion
             else:
                 await self.client.abort(request_id)

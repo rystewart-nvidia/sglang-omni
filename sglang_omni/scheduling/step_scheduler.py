@@ -104,16 +104,13 @@ class StepScheduler:
         self.shutdown_callback = shutdown_callback
         self.requests: dict[str, StepRequest] = {}
         self.active: set[str] = set()
-        # note (Richard Wang): Aborts can arrive before admission or after
-        # completion. A bounded window of ids drops a late message for an
-        # aborted request.
+        # note (Richard Wang): A bounded window of aborted ids drops their late messages.
         self.aborted_request_ids: dict[str, None] = {}
         self.wakeup = threading.Event()
         self.inbox = StepInbox(self.wakeup)
         self.outbox: queue.Queue[OutgoingMessage] = queue.Queue()
         self.lock = threading.Lock()
-        # note (Richard Wang): A stop that arrives before the stage thread calls
-        # start must hold.
+        # note (Richard Wang): A stop before the stage thread calls start must hold.
         self.running = True
 
     def warm_up_serving_thread(self) -> None:
@@ -122,8 +119,7 @@ class StepScheduler:
     def start(self) -> None:
         """Run the scheduler loop on the calling thread until stop."""
         try:
-            # note (Richard Wang): Leaving the pool waits for in-flight steps, so
-            # tasks close only after their device work settles.
+            # note (Richard Wang): Leaving the pool waits for in-flight steps before tasks close.
             with ThreadPoolExecutor(
                 self.max_workers, thread_name_prefix="omni-step"
             ) as executor:
@@ -204,8 +200,7 @@ class StepScheduler:
             if not task.bounded_by_stage and sum(
                 not request.task.bounded_by_stage for request in self.requests.values()
             ) > (self.max_running_requests + self.max_queued_requests):
-                # note (Richard Wang): A rejected live operation may own session
-                # state, so close it.
+                # note (Richard Wang): A rejected live operation may own session state, so close it.
                 self.finish_request(request_id, error=QueueFullError())
             else:
                 pass
@@ -240,8 +235,7 @@ class StepScheduler:
                 self.active.add(request_id)
         running = sum(request.future is not None for request in self.requests.values())
         while running < self.max_workers:
-            # note (Richard Wang): A newly active request runs its first step
-            # before others continue.
+            # note (Richard Wang): A newly active request steps once before others continue.
             request_id = None
             for candidate, request in self.requests.items():
                 if candidate not in self.active or request.future is not None:
